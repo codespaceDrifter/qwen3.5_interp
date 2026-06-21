@@ -53,7 +53,7 @@ LOG_EVERY = 100            # chunks
 
 # On GPUs with enough VRAM (e.g. RTX Pro 6000 96 GB), keep all 32 optimizers on GPU.
 # On 32 GB cards, set this True to swap only one optimizer to GPU at a time.
-SWAP_OPTIMIZERS = False
+SWAP_OPTIMIZERS = True
 
 # device/dtype for the base model and SAEs
 DEVICE = "cuda"
