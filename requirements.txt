@@ -1,0 +1,18 @@
+# torch is assumed to be installed separately (use your CUDA version)
+# torch
+torchvision
+safetensors
+huggingface_hub
+fastapi
+uvicorn
+tokenizers
+numpy
+pyarrow
+
+# optional but recommended for SAE training on a 32 GB card
+bitsandbytes
+
+# only needed for verify_diff_hf.py
+# transformers
+
+#pip install torch torchvision safetensors huggingface_hub fastapi uvicorn tokenizers numpy pyarrow bitsandbytes transformers -i https://pypi.tuna.tsinghua.edu.cn/simple
