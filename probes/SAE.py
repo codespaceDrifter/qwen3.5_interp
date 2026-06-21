@@ -35,6 +35,7 @@ class SAE (nn.Module):
         return smooth + (hard - smooth).detach()
 
     def encode (self, input):
+        input = input.to(self.encoder_weight.dtype)
         pre_gate_features = (input - self.decoder_bias) @ self.encoder_weight.T + self.encoder_bias
 
         slab_lower_gate = self.ste_gate(pre_gate_features, self.slab_gate_lower_bound, True)

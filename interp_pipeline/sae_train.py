@@ -194,7 +194,7 @@ def main(
             if i not in captured:
                 continue
 
-            acts = captured[i].to(device)            # (B, L, D)
+            acts = captured[i].to(device).to(dtype)  # (B, L, D)
             acts = acts.view(-1, acts.shape[-1])     # (B*L, D)
 
             if SWAP_OPTIMIZERS:
