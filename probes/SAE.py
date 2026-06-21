@@ -25,11 +25,12 @@ class SAE (nn.Module):
     # straight through estimator
     # we want to use hard for forward but use soft estimator for backprop
     def ste_gate (self, arg, threshhold, lower_bound):
+        dtype = arg.dtype
         if lower_bound == True:
-            hard = (arg >= threshhold).float()
+            hard = (arg >= threshhold).to(dtype)
             smooth = torch.sigmoid ((arg - threshhold) / self.band_eps)
         else:
-            hard = (arg < threshhold).float()
+            hard = (arg < threshhold).to(dtype)
             smooth = torch.sigmoid ((threshhold - arg) / self.band_eps)
         # forward value = hard, backward due to detach gradient uses soft
         return smooth + (hard - smooth).detach()
