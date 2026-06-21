@@ -20,7 +20,7 @@ else:
 # where tokenized outputs go
 TOKENIZED_DIR = DATA_ROOT / "tokenized_interpmix"
 
-# where trained SAE weights and checkpoints go
+# where trained SAE weights and checkpoints go.
 SAE_WEIGHTS_DIR = DATA_ROOT / "sae_weights"
 
 # qwen3.5 tokenizer bundled in this repo
@@ -48,7 +48,7 @@ TARGET_ACTIVE = 64
 SPARSITY_COEFF_INIT = 1e-3
 BAND_EPS = 0.001
 
-CHECKPOINT_EVERY = 50000   # chunks
+CHECKPOINT_EVERY = 10000   # chunks
 LOG_EVERY = 100            # chunks
 
 # On GPUs with enough VRAM (e.g. RTX Pro 6000 96 GB), keep all 32 optimizers on GPU.
