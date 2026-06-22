@@ -30,6 +30,8 @@ from interp_pipeline.config import (
     CHUNK_SIZE,
     DEVICE,
     EXPANSION_FACTOR,
+    LAYER_END,
+    LAYER_START,
     LEARNING_RATE,
     LOG_EVERY,
     SAE_DTYPE,
@@ -67,6 +69,15 @@ def state_dict_to_cpu(state_dict):
         else:
             result[k] = v
     return result
+
+
+def print_vram(label: str = ""):
+    if torch.cuda.is_available():
+        allocated = torch.cuda.memory_allocated() / 1e9
+        reserved = torch.cuda.memory_reserved() / 1e9
+        total = torch.cuda.get_device_properties(0).total_memory / 1e9
+        prefix = f"VRAM [{label}] " if label else "VRAM "
+        print(f"{prefix}allocated: {allocated:.2f} GB | reserved: {reserved:.2f} GB | total: {total:.2f} GB")
 
 
 # =========================================================================================
@@ -138,11 +149,15 @@ def main(
     text_cfg = config.text_config
     hidden_size = text_cfg.hidden_size
     num_layers = text_cfg.num_hidden_layers
-    print(f"building {num_layers} SAEs for {CAPTURE_TYPE}...")
+    layer_start = max(0, LAYER_START)
+    layer_end = min(num_layers - 1, LAYER_END)
+    num_train_layers = layer_end - layer_start + 1
+    print(f"building {num_train_layers} SAEs for {CAPTURE_TYPE} (layers {layer_start}-{layer_end})...")
     saes = nn.ModuleList([
         SAE(hidden_size, EXPANSION_FACTOR, band_eps=BAND_EPS)
-        for _ in range(num_layers)
+        for _ in range(num_train_layers)
     ]).to(device).to(dtype)
+    print_vram("after building SAEs")
 
     sparsity_coeffs = [SPARSITY_COEFF_INIT for _ in saes]
 
@@ -152,10 +167,11 @@ def main(
         optimizers = None
         print("optimizer mode: swap one at a time (low VRAM)")
     else:
-        # 96 GB card mode: keep all 32 optimizers on GPU
+        # 96 GB card mode: keep all optimizers on GPU
         optimizers = [make_optimizer(sae, LEARNING_RATE) for sae in saes]
         optimizer_states = None
         print("optimizer mode: all optimizers on GPU (high VRAM)")
+    print_vram("after building optimizers")
 
     # ---- load token bin ----
     bin_path = TOKENIZED_DIR / "tokenized_interpmix.bin"
@@ -191,11 +207,12 @@ def main(
 
         # train each layer's SAE one at a time
         for i, sae in enumerate(saes):
-            if i not in captured:
+            layer_idx = layer_start + i
+            if layer_idx not in captured:
                 continue
 
-            acts = captured[i].to(device).to(dtype)  # (B, L, D)
-            acts = acts.view(-1, acts.shape[-1])     # (B*L, D)
+            acts = captured[layer_idx].to(device).to(dtype)  # (B, L, D)
+            acts = acts.view(-1, acts.shape[-1])             # (B*L, D)
 
             if SWAP_OPTIMIZERS:
                 opt = make_optimizer(sae, LEARNING_RATE)
@@ -220,7 +237,7 @@ def main(
             if step % LOG_EVERY == 0 and step > 0:
                 log.append({
                     "step": step,
-                    "layer": i,
+                    "layer": layer_idx,
                     "loss": loss,
                     "l0": l0,
                     "recon": recon,
@@ -232,13 +249,14 @@ def main(
             ckpt_dir = SAE_WEIGHTS_DIR / CAPTURE_TYPE / f"step_{step}"
             ckpt_dir.mkdir(parents=True, exist_ok=True)
             for i, sae in enumerate(saes):
-                torch.save(sae.state_dict(), ckpt_dir / f"layer_{i}.pt")
+                torch.save(sae.state_dict(), ckpt_dir / f"layer_{layer_start + i}.pt")
             print(f"saved checkpoint at step {step}")
 
         if step % LOG_EVERY == 0 and step > 0:
             elapsed = time.time() - start_time
             tok_per_sec = (step * BATCH_SIZE * CHUNK_SIZE) / elapsed
             print(f"step {step} | tok/s: {tok_per_sec:,.0f} | elapsed: {elapsed/3600:.2f}h")
+            print_vram("log")
 
         # clear CPU activation cache before the next forward
         captured.clear()
@@ -247,13 +265,14 @@ def main(
     final_dir = SAE_WEIGHTS_DIR / CAPTURE_TYPE / "final"
     final_dir.mkdir(parents=True, exist_ok=True)
     for i, sae in enumerate(saes):
-        torch.save(sae.state_dict(), final_dir / f"layer_{i}.pt")
+        torch.save(sae.state_dict(), final_dir / f"layer_{layer_start + i}.pt")
 
     with open(final_dir / "log.json", "w") as f:
         json.dump(log, f)
 
     total_time = time.time() - start_time
     print(f"done in {total_time/3600:.2f}h")
+    print_vram("final")
 
 
 def _dtype_from_string(s: str) -> torch.dtype:
