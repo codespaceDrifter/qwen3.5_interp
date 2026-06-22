@@ -48,17 +48,12 @@ TARGET_ACTIVE = 64
 SPARSITY_COEFF_INIT = 1e-3
 BAND_EPS = 0.001
 
-CHECKPOINT_EVERY = 10000   # chunks
+CHECKPOINT_EVERY = 100     # chunks
 LOG_EVERY = 100            # chunks
 
 # On GPUs with enough VRAM (e.g. RTX Pro 6000 96 GB), keep all 32 optimizers on GPU.
 # On 32 GB cards, set this True to swap only one optimizer to GPU at a time.
 SWAP_OPTIMIZERS = True
-
-# Train only a subset of layers per run. Useful for splitting 32 layers across
-# multiple passes on limited VRAM. Layer indices are 0-based inclusive.
-LAYER_START = 0
-LAYER_END = 31
 
 # device/dtype for the base model and SAEs
 DEVICE = "cuda"

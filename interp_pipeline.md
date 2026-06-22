@@ -1,4 +1,10 @@
+# random gpu mon note  
+while true; do nvidia-smi --query-gpu=timestamp,utilization.gpu,memory.used,memory.total --format=csv,noheader; sleep 1; done
+
+
+
 # file order
+
 
 Run these from the repo root in order:
 

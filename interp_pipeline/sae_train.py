@@ -12,6 +12,7 @@
 
 import argparse
 import json
+import shutil
 import time
 from pathlib import Path
 
@@ -30,8 +31,6 @@ from interp_pipeline.config import (
     CHUNK_SIZE,
     DEVICE,
     EXPANSION_FACTOR,
-    LAYER_END,
-    LAYER_START,
     LEARNING_RATE,
     LOG_EVERY,
     SAE_DTYPE,
@@ -78,6 +77,134 @@ def print_vram(label: str = ""):
         total = torch.cuda.get_device_properties(0).total_memory / 1e9
         prefix = f"VRAM [{label}] " if label else "VRAM "
         print(f"{prefix}allocated: {allocated:.2f} GB | reserved: {reserved:.2f} GB | total: {total:.2f} GB")
+
+
+def latest_checkpoint_dir(capture_type: str) -> Path:
+    return SAE_WEIGHTS_DIR / capture_type / "latest"
+
+
+def prev_checkpoint_dir(capture_type: str) -> Path:
+    return SAE_WEIGHTS_DIR / capture_type / "prev"
+
+
+def checkpoint_dir_order() -> list:
+    return ["latest", "prev"]
+
+
+def _state_dict_has_invalid(state_dict) -> bool:
+    """Return True if any tensor in the state dict contains NaN or Inf."""
+    for v in state_dict.values():
+        if isinstance(v, dict):
+            if _state_dict_has_invalid(v):
+                return True
+        elif isinstance(v, torch.Tensor):
+            if torch.isnan(v).any() or torch.isinf(v).any():
+                return True
+    return False
+
+
+def _saes_have_invalid(saes: nn.ModuleList) -> bool:
+    """Return True if any SAE parameter contains NaN or Inf."""
+    for sae in saes:
+        if _state_dict_has_invalid(sae.state_dict()):
+            return True
+    return False
+
+
+def _load_one_checkpoint(ckpt_dir: Path, saes: nn.ModuleList, device, dtype):
+    """Load a single checkpoint directory. Returns parsed state or raises on failure/NaN."""
+    # SAE weights
+    for i, sae in enumerate(saes):
+        path = ckpt_dir / f"layer_{i}.pt"
+        if not path.exists():
+            raise FileNotFoundError(f"missing layer weight: {path}")
+        sae.load_state_dict(torch.load(path, map_location="cpu", weights_only=True))
+        sae.to(device).to(dtype)
+
+    if _saes_have_invalid(saes):
+        raise ValueError("SAE weights contain NaN or Inf")
+
+    state = torch.load(ckpt_dir / "training_state.pt", map_location="cpu", weights_only=False)
+    saved_step = state["step"]
+    sparsity_coeffs = state["sparsity_coeffs"]
+    log = state["log"]
+
+    optimizer_states = torch.load(
+        ckpt_dir / "optimizer_states.pt", map_location="cpu", weights_only=False
+    )
+
+    return saved_step, optimizer_states, sparsity_coeffs, log
+
+
+def save_checkpoint(
+    capture_type: str,
+    step: int,
+    saes: nn.ModuleList,
+    optimizer_states: list,
+    optimizers: list,
+    sparsity_coeffs: list,
+    log: list,
+):
+    """Atomically save a resumable checkpoint, keeping the previous one as `prev`."""
+    ckpt_dir = latest_checkpoint_dir(capture_type)
+    prev_dir = prev_checkpoint_dir(capture_type)
+    tmp_dir = ckpt_dir.with_suffix(".tmp")
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+
+    # SAE weights
+    for i, sae in enumerate(saes):
+        torch.save(sae.state_dict(), tmp_dir / f"layer_{i}.pt")
+
+    # optimizer states: when SWAP_OPTIMIZERS is True these are already on CPU.
+    # when False, dump current GPU optimizer states to CPU.
+    if optimizers is not None:
+        states_to_save = [state_dict_to_cpu(opt.state_dict()) for opt in optimizers]
+    else:
+        states_to_save = optimizer_states
+    torch.save(states_to_save, tmp_dir / "optimizer_states.pt")
+
+    # everything else needed to resume exactly
+    torch.save({
+        "step": step,
+        "sparsity_coeffs": sparsity_coeffs,
+        "log": log,
+    }, tmp_dir / "training_state.pt")
+
+    # rotate: latest -> prev, then tmp -> latest
+    if prev_dir.exists():
+        shutil.rmtree(prev_dir)
+    if ckpt_dir.exists():
+        ckpt_dir.rename(prev_dir)
+    tmp_dir.rename(ckpt_dir)
+
+
+def load_checkpoint(capture_type: str, saes: nn.ModuleList, device, dtype):
+    """Load the latest valid checkpoint, falling back to prev if latest is corrupt.
+
+    Returns (start_step, optimizer_states, optimizers, sparsity_coeffs, log) or None.
+    """
+    roots = {
+        "latest": latest_checkpoint_dir(capture_type),
+        "prev": prev_checkpoint_dir(capture_type),
+    }
+
+    for name in checkpoint_dir_order():
+        ckpt_dir = roots[name]
+        if not ckpt_dir.exists():
+            continue
+        try:
+            print(f"resuming from checkpoint: {ckpt_dir}")
+            saved_step, optimizer_states, sparsity_coeffs, log = _load_one_checkpoint(
+                ckpt_dir, saes, device, dtype
+            )
+            print(f"  resumed at step {saved_step}")
+            print_vram("after resume load")
+            return saved_step, optimizer_states, None, sparsity_coeffs, log
+        except Exception as e:
+            print(f"  failed to load {name}: {e}")
+
+    print("no valid checkpoint found, starting from scratch")
+    return None
 
 
 # =========================================================================================
@@ -133,44 +260,59 @@ def main(
         print("CUDA not available, falling back to CPU")
         device = torch.device("cpu")
 
+    # ---- build SAEs (random init; overwritten by checkpoint if resuming) ----
+    config = Qwen3_5Config()
+    text_cfg = config.text_config
+    hidden_size = text_cfg.hidden_size
+    num_layers = text_cfg.num_hidden_layers
+    print(f"building {num_layers} SAEs for {CAPTURE_TYPE}...")
+    saes = nn.ModuleList([
+        SAE(hidden_size, EXPANSION_FACTOR, band_eps=BAND_EPS)
+        for _ in range(num_layers)
+    ]).to(device).to(dtype)
+    print_vram("after building SAEs")
+
+    sparsity_coeffs = [SPARSITY_COEFF_INIT for _ in saes]
+    log = []
+    start_step = 0
+    loaded_optimizer_states = None
+
+    # ---- try to resume before loading the heavy model ----
+    loaded = load_checkpoint(CAPTURE_TYPE, saes, device, dtype)
+    if loaded is not None:
+        saved_step, loaded_optimizer_states, _, sparsity_coeffs, log = loaded
+        start_step = saved_step + 1
+
     # ---- load model ----
     print("loading model...")
-    config = Qwen3_5Config()
     model = Qwen3_5ForCausalLM(config)
     load_weights(model, "weights", device=device, dtype=dtype, strict=True)
     model.to(device)
     model.eval()
     print("model loaded")
+    print_vram("after model load")
 
     # ---- register hooks ----
     captured = register_capture_hooks(model, CAPTURE_TYPE)
 
-    # ---- build SAEs (all on GPU if available) ----
-    text_cfg = config.text_config
-    hidden_size = text_cfg.hidden_size
-    num_layers = text_cfg.num_hidden_layers
-    layer_start = max(0, LAYER_START)
-    layer_end = min(num_layers - 1, LAYER_END)
-    num_train_layers = layer_end - layer_start + 1
-    print(f"building {num_train_layers} SAEs for {CAPTURE_TYPE} (layers {layer_start}-{layer_end})...")
-    saes = nn.ModuleList([
-        SAE(hidden_size, EXPANSION_FACTOR, band_eps=BAND_EPS)
-        for _ in range(num_train_layers)
-    ]).to(device).to(dtype)
-    print_vram("after building SAEs")
-
-    sparsity_coeffs = [SPARSITY_COEFF_INIT for _ in saes]
-
+    # ---- build optimizers after resume so they bind to resumed parameters ----
     if SWAP_OPTIMIZERS:
         # 32 GB card mode: optimizer state dicts live on CPU; only one optimizer on GPU at a time
-        optimizer_states = [None for _ in saes]
+        if loaded_optimizer_states is not None:
+            optimizer_states = loaded_optimizer_states
+        else:
+            optimizer_states = [None for _ in saes]
         optimizers = None
         print("optimizer mode: swap one at a time (low VRAM)")
     else:
-        # 96 GB card mode: keep all optimizers on GPU
+        # 96 GB card mode: keep all 32 optimizers on GPU
         optimizers = [make_optimizer(sae, LEARNING_RATE) for sae in saes]
         optimizer_states = None
         print("optimizer mode: all optimizers on GPU (high VRAM)")
+        if loaded_optimizer_states is not None:
+            for opt, state in zip(optimizers, loaded_optimizer_states):
+                opt.load_state_dict(state)
+            print("restored optimizer states")
     print_vram("after building optimizers")
 
     # ---- load token bin ----
@@ -190,16 +332,15 @@ def main(
     # ---- training loop ----
     print("training...")
     start_time = time.time()
-    log = []
 
-    for step in range(num_chunks // BATCH_SIZE):
+    for step in range(start_step, num_chunks // BATCH_SIZE):
         # build batch
-        start = step * BATCH_SIZE * CHUNK_SIZE
-        end = start + BATCH_SIZE * CHUNK_SIZE
-        if end > len(all_tokens):
+        batch_start = step * BATCH_SIZE * CHUNK_SIZE
+        batch_end = batch_start + BATCH_SIZE * CHUNK_SIZE
+        if batch_end > len(all_tokens):
             break
 
-        batch_ids = torch.from_numpy(all_tokens[start:end]).view(BATCH_SIZE, CHUNK_SIZE).to(device)
+        batch_ids = torch.from_numpy(all_tokens[batch_start:batch_end]).view(BATCH_SIZE, CHUNK_SIZE).to(device)
 
         # forward pass, capture activations to CPU (no KV cache needed for training)
         with torch.no_grad():
@@ -207,12 +348,11 @@ def main(
 
         # train each layer's SAE one at a time
         for i, sae in enumerate(saes):
-            layer_idx = layer_start + i
-            if layer_idx not in captured:
+            if i not in captured:
                 continue
 
-            acts = captured[layer_idx].to(device).to(dtype)  # (B, L, D)
-            acts = acts.view(-1, acts.shape[-1])             # (B*L, D)
+            acts = captured[i].to(device).to(dtype)  # (B, L, D)
+            acts = acts.view(-1, acts.shape[-1])     # (B*L, D)
 
             if SWAP_OPTIMIZERS:
                 opt = make_optimizer(sae, LEARNING_RATE)
@@ -226,7 +366,6 @@ def main(
             )
 
             if SWAP_OPTIMIZERS:
-                # store optimizer state on CPU and free the GPU optimizer object
                 optimizer_states[i] = state_dict_to_cpu(opt.state_dict())
                 del opt
                 if torch.cuda.is_available():
@@ -237,25 +376,33 @@ def main(
             if step % LOG_EVERY == 0 and step > 0:
                 log.append({
                     "step": step,
-                    "layer": layer_idx,
+                    "layer": i,
                     "loss": loss,
                     "l0": l0,
                     "recon": recon,
                     "sparsity_coeff": sparsity_coeffs[i],
                 })
 
-        # checkpoint
+        # checkpoint (overwrites `latest`)
         if step % CHECKPOINT_EVERY == 0 and step > 0:
-            ckpt_dir = SAE_WEIGHTS_DIR / CAPTURE_TYPE / f"step_{step}"
-            ckpt_dir.mkdir(parents=True, exist_ok=True)
-            for i, sae in enumerate(saes):
-                torch.save(sae.state_dict(), ckpt_dir / f"layer_{layer_start + i}.pt")
+            save_checkpoint(
+                CAPTURE_TYPE,
+                step,
+                saes,
+                optimizer_states,
+                optimizers,
+                sparsity_coeffs,
+                log,
+            )
             print(f"saved checkpoint at step {step}")
 
         if step % LOG_EVERY == 0 and step > 0:
             elapsed = time.time() - start_time
             tok_per_sec = (step * BATCH_SIZE * CHUNK_SIZE) / elapsed
-            print(f"step {step} | tok/s: {tok_per_sec:,.0f} | elapsed: {elapsed/3600:.2f}h")
+            print(
+                f"step {step} | tok/s: {tok_per_sec:,.0f} | elapsed: {elapsed/3600:.2f}h | "
+                f"recon: {recon:.6f} | sparsity: {l0:.6f}"
+            )
             print_vram("log")
 
         # clear CPU activation cache before the next forward
@@ -265,7 +412,7 @@ def main(
     final_dir = SAE_WEIGHTS_DIR / CAPTURE_TYPE / "final"
     final_dir.mkdir(parents=True, exist_ok=True)
     for i, sae in enumerate(saes):
-        torch.save(sae.state_dict(), final_dir / f"layer_{layer_start + i}.pt")
+        torch.save(sae.state_dict(), final_dir / f"layer_{i}.pt")
 
     with open(final_dir / "log.json", "w") as f:
         json.dump(log, f)
