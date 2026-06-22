@@ -24,7 +24,6 @@ Qwen3.5-4B dimensions:
 | tie_word_embeddings | True |
 | max_position_embeddings | 262144 |
 
-Bold items are covered below.
 
 ---
 
@@ -36,7 +35,7 @@ Bold items are covered below.
                    ▼
             ┌──────────────┐
             │ embed_tokens │  (tied to lm_head)
-            │  (× √2560)   │
+            │              │
             └──────┬───────┘
                    │ (B, T, 2560)
                    ▼
@@ -140,8 +139,9 @@ Unusual details:
 `q_proj` projects hidden states to **twice** the query dimension. The output is split into actual queries and a multiplicative gate:
 
 ```python
-query, gate = chunk(q_proj(x))      # each (B, T, num_heads * head_dim)
-output = o_proj(attention_output) * sigmoid(gate)
+query, gate = chunk(q_proj(x))      # query: (B, T, num_heads, head_dim)
+                                    # gate:  (B, T, num_heads * head_dim)
+output = o_proj(attention_output * sigmoid(gate))
 ```
 
 The gate is a per-head soft switch on the attention output.
@@ -225,7 +225,7 @@ No bias. This is the same SwiGLU pattern as Llama/Qwen2.5.
 | Site | What you'd get | How |
 |---|---|---|
 | Residual stream | Trunk between layers | `register_forward_hook` on each `Qwen3_5DecoderLayer` |
-| Full-attention output | Attention's contribution to the residual | hook on `layer.self_attn` |
+| Full-attention output | Attention's contribution to the residual | hook after `o_proj` inside `Qwen3_5Attention.forward`, or around `self_attn(...)` in `Qwen3_5DecoderLayer.forward` |
 | Linear-attention output | Gated DeltaNet's contribution to the residual | hook on `layer.linear_attn` |
 | MLP output | MLP's contribution to the residual | hook on `layer.mlp` |
 | Q / K / V (post-RoPE) | Full-attention head dynamics | hook inside `Qwen3_5Attention.forward` |

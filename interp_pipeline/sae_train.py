@@ -29,6 +29,8 @@ from interp_pipeline.config import (
     CAPTURE_TYPE,
     CHECKPOINT_EVERY,
     CHUNK_SIZE,
+    CLIP_GRAD_NORM,
+    CLIP_GRAD_VALUE,
     DEVICE,
     EXPANSION_FACTOR,
     LEARNING_RATE,
@@ -313,6 +315,12 @@ def main(
             for opt, state in zip(optimizers, loaded_optimizer_states):
                 opt.load_state_dict(state)
             print("restored optimizer states")
+
+    # report the actual optimizer class being used (8-bit vs full)
+    tmp_opt = make_optimizer(saes[0], LEARNING_RATE)
+    print(f"optimizer class: {type(tmp_opt).__name__}")
+    del tmp_opt
+
     print_vram("after building optimizers")
 
     # ---- load token bin ----
@@ -362,7 +370,13 @@ def main(
                 opt = optimizers[i]
 
             sparsity_coeffs[i], loss, l0, recon = train_SAE(
-                sae, acts, opt, TARGET_ACTIVE, sparsity_coeffs[i]
+                sae,
+                acts,
+                opt,
+                TARGET_ACTIVE,
+                sparsity_coeffs[i],
+                clip_grad_norm=CLIP_GRAD_NORM,
+                clip_grad_value=CLIP_GRAD_VALUE,
             )
 
             if SWAP_OPTIMIZERS:

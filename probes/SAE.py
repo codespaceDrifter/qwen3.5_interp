@@ -58,7 +58,15 @@ class SAE (nn.Module):
 
 # trains SAE from streaming activations of the model
 # assumes a sparsity_coeff is initalized at 1e-3
-def train_SAE (sae:SAE, activation, optimizer, target_active, sparsity_coeff):
+def train_SAE (
+    sae:SAE,
+    activation,
+    optimizer,
+    target_active,
+    sparsity_coeff,
+    clip_grad_norm=None,
+    clip_grad_value=None,
+):
     features, combined_gate = sae.encode(activation)
 
     error = (combined_gate.sum(-1) - target_active).mean()
@@ -71,6 +79,10 @@ def train_SAE (sae:SAE, activation, optimizer, target_active, sparsity_coeff):
 
     optimizer.zero_grad()
     loss.backward()
+    if clip_grad_norm is not None:
+        torch.nn.utils.clip_grad_norm_(sae.parameters(), max_norm=clip_grad_norm)
+    if clip_grad_value is not None:
+        torch.nn.utils.clip_grad_value_(sae.parameters(), clip_value=clip_grad_value)
     optimizer.step()
 
     # keep decoder feature columns uniform

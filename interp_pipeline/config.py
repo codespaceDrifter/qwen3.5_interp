@@ -51,6 +51,12 @@ BAND_EPS = 0.001
 CHECKPOINT_EVERY = 100     # chunks
 LOG_EVERY = 100            # chunks
 
+# gradient clipping. None disables.
+# CLIP_GRAD_NORM clips the total L2 norm of all gradients together.
+# CLIP_GRAD_VALUE clips each gradient element individually to [-value, value].
+CLIP_GRAD_NORM = None
+CLIP_GRAD_VALUE = 1.0
+
 # On GPUs with enough VRAM (e.g. RTX Pro 6000 96 GB), keep all 32 optimizers on GPU.
 # On 32 GB cards, set this True to swap only one optimizer to GPU at a time.
 SWAP_OPTIMIZERS = True
