@@ -57,9 +57,9 @@ LOG_EVERY = 100            # chunks
 CLIP_GRAD_NORM = None
 CLIP_GRAD_VALUE = 1.0
 
-# On GPUs with enough VRAM (e.g. RTX Pro 6000 96 GB), keep all 32 optimizers on GPU.
-# On 32 GB cards, set this True to swap only one optimizer to GPU at a time.
-SWAP_OPTIMIZERS = True
+# Optimizer memory mode. PagedAdamW8bit keeps most optimizer state in CPU RAM and
+# pages it to GPU per layer. This avoids manual swapping and should fit on 96 GB.
+PAGE_OPTIMIZERS = True
 
 # device/dtype for the base model and SAEs
 DEVICE = "cuda"
