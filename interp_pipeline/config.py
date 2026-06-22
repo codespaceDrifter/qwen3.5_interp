@@ -33,13 +33,14 @@ TOKEN_DTYPE = "int32"
 # SAE training config
 # =========================================================================================
 
-# which subblock output / residual stream point to train on
-# these are all the tensors that get ADDED INTO or CARRIED BY the residual stream:
-#   "residue"              = full decoder layer output (after both residual adds)
-#   "post_attn_norm"       = full-attention subblock output, before the first residual add
-#   "post_linear_attn_norm"= linear-attention (Gated DeltaNet) subblock output, before residual add
-#   "post_mlp_norm"        = MLP subblock output, before the second residual add
-CAPTURE_TYPE = "post_attn_norm"
+# which subblock output to train on (pre-norm model, so these are the subblock
+# outputs that get added into the residual stream):
+#   "residue"         = full decoder layer output (after both residual adds)
+#   "attn_out"        = full self-attention subblock output
+#   "linear_attn_out" = linear attention / Gated DeltaNet subblock output
+#   "mlp_out"         = MLP subblock output
+#   "attention"       = trains attn_out + linear_attn_out in one run
+CAPTURE_TYPE = "attention"
 
 EXPANSION_FACTOR = 16
 BATCH_SIZE = 16

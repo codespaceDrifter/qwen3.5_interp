@@ -1,31 +1,48 @@
-# Sample and decode random chunks from the tokenized interpmix bin.
-# Usage from repo root:
+# Quick inspect: pick a random starting chunk and print 10 consecutive chunks
+# to visually verify the .bin file is shuffled.
+#
+# Usage:
 #   python3 -m interp_pipeline.inspect_tokenized
 
-import numpy as np
-from tokenizers import Tokenizer
+import argparse
+import random
+from pathlib import Path
 
-from interp_pipeline.config import CHUNK_SIZE, DEFAULT_TOKENIZER_PATH, TOKENIZED_DIR
+import numpy as np
+
+from interp_pipeline.config import CHUNK_SIZE, DEFAULT_TOKENIZER_PATH, TOKENIZED_DIR, TOKEN_DTYPE
+from interp_pipeline.tokenize_interp_mix import Qwen3_5Tokenizer
+
+
+def inspect(bin_path: Path, start_chunk: int | None = None):
+    tok = Qwen3_5Tokenizer(DEFAULT_TOKENIZER_PATH)
+    flat = np.fromfile(bin_path, dtype=TOKEN_DTYPE)
+    num_chunks = len(flat) // CHUNK_SIZE
+
+    if start_chunk is None:
+        start_chunk = random.randint(0, max(0, num_chunks - 10))
+
+    print(f"total chunks: {num_chunks:,}")
+    print(f"showing chunks {start_chunk} to {start_chunk + 9}\n")
+
+    for offset in range(10):
+        idx = start_chunk + offset
+        if idx >= num_chunks:
+            break
+        chunk = flat[idx * CHUNK_SIZE:(idx + 1) * CHUNK_SIZE]
+        text = tok.tok.decode(chunk.tolist())
+        print(f"--- chunk {idx} ---")
+        print(text[:500])
+        print(f"[length: {len(text)} chars, first 10 tokens: {chunk[:10].tolist()}]\n")
 
 
 def main():
-    tok = Tokenizer.from_file(str(DEFAULT_TOKENIZER_PATH))
-    bin_path = TOKENIZED_DIR / "tokenized_interpmix.bin"
+    parser = argparse.ArgumentParser(description="Inspect consecutive chunks of tokenized data.")
+    parser.add_argument("--bin", type=Path, default=TOKENIZED_DIR / "tokenized_interpmix.bin")
+    parser.add_argument("--start-chunk", type=int, default=None, help="starting chunk index")
+    args = parser.parse_args()
 
-    tokens = np.fromfile(bin_path, dtype="int32")
-    total_chunks = len(tokens) // CHUNK_SIZE
-
-    print(f"total tokens: {len(tokens):,}")
-    print(f"total chunks: {total_chunks:,}\n")
-
-    num_samples = 5
-    for i in range(num_samples):
-        idx = np.random.randint(0, total_chunks) * CHUNK_SIZE
-        chunk = tokens[idx : idx + CHUNK_SIZE]
-        text = tok.decode(chunk.tolist())
-        print(f"=== sample {i + 1} (chunk {idx // CHUNK_SIZE}) ===")
-        print(text[:1200])
-        print("...\n")
+    inspect(args.bin, args.start_chunk)
 
 
 if __name__ == "__main__":

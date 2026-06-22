@@ -1,11 +1,17 @@
-# train one SAE type (residue / post_attn_norm / post_linear_attn_norm / post_mlp_norm)
-# for all 32 layers of Qwen3.5-4B.
+# train one or more SAE capture types for all 32 layers of Qwen3.5-4B.
 #
 # Memory strategy:
 #   - the base model and all SAEs stay on GPU.
 #   - activations are copied to CPU RAM in the hooks so they don't pile up in VRAM.
 #   - optimizers use bitsandbytes PagedAdamW8bit so their state pages to CPU RAM
 #     automatically per layer. no manual swapping.
+#
+# Supported CAPTURE_TYPE values (set in interp_pipeline/config.py):
+#   "residue"      -> full decoder layer output
+#   "attn_out"     -> full self-attention subblock output
+#   "linear_attn_out" -> linear attention / Gated DeltaNet subblock output
+#   "mlp_out"      -> MLP subblock output
+#   "attention"    -> trains attn_out + linear_attn_out in a single run
 #
 # usage from repo root:
 #   python3 -m interp_pipeline.sae_train
@@ -15,6 +21,7 @@ import datetime
 import json
 import shutil
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -85,20 +92,74 @@ def print_vram(label: str = ""):
         print(f"{prefix}allocated: {allocated:.2f} GB | reserved: {reserved:.2f} GB | total: {total:.2f} GB")
 
 
-def latest_checkpoint_dir(capture_type: str) -> Path:
-    return SAE_WEIGHTS_DIR / capture_type / "latest"
+# =========================================================================================
+# capture specification
+# =========================================================================================
+
+def make_hook(captured: dict, key):
+    """Factory for a hook that stores the first tensor output under `key`."""
+    def hook(module, input, output):
+        tensor = output[0] if isinstance(output, tuple) else output
+        captured[key] = tensor.detach().cpu()
+    return hook
 
 
-def prev_checkpoint_dir(capture_type: str) -> Path:
-    return SAE_WEIGHTS_DIR / capture_type / "prev"
+def register_residue_hooks(model: Qwen3_5ForCausalLM, captured: dict):
+    text_model = model.model.language_model
+    for i, layer in enumerate(text_model.layers):
+        layer.register_forward_hook(make_hook(captured, ("residue", i)))
 
 
-def checkpoint_dir_order() -> list:
-    return ["latest", "prev"]
+def register_attn_hooks(model: Qwen3_5ForCausalLM, captured: dict):
+    text_model = model.model.language_model
+    for i, layer in enumerate(text_model.layers):
+        if hasattr(layer, "self_attn"):
+            layer.self_attn.register_forward_hook(make_hook(captured, ("attn_out", i)))
+
+
+def register_linear_attn_hooks(model: Qwen3_5ForCausalLM, captured: dict):
+    text_model = model.model.language_model
+    for i, layer in enumerate(text_model.layers):
+        if hasattr(layer, "linear_attn"):
+            layer.linear_attn.register_forward_hook(make_hook(captured, ("linear_attn_out", i)))
+
+
+def register_mlp_hooks(model: Qwen3_5ForCausalLM, captured: dict):
+    text_model = model.model.language_model
+    for i, layer in enumerate(text_model.layers):
+        layer.mlp.register_forward_hook(make_hook(captured, ("mlp_out", i)))
+
+
+def get_capture_specs(capture_type: str) -> list:
+    """Return the list of capture specs to train for a given CAPTURE_TYPE."""
+    specs = {
+        "residue": [("residue", register_residue_hooks)],
+        "attn_out": [("attn_out", register_attn_hooks)],
+        "linear_attn_out": [("linear_attn_out", register_linear_attn_hooks)],
+        "mlp_out": [("mlp_out", register_mlp_hooks)],
+        "attention": [
+            ("attn_out", register_attn_hooks),
+            ("linear_attn_out", register_linear_attn_hooks),
+        ],
+    }
+    if capture_type not in specs:
+        raise ValueError(f"unknown CAPTURE_TYPE: {capture_type}")
+    return specs[capture_type]
+
+
+# =========================================================================================
+# checkpointing
+# =========================================================================================
+
+def latest_checkpoint_dir(capture_name: str) -> Path:
+    return SAE_WEIGHTS_DIR / capture_name / "latest"
+
+
+def prev_checkpoint_dir(capture_name: str) -> Path:
+    return SAE_WEIGHTS_DIR / capture_name / "prev"
 
 
 def _state_dict_has_invalid(state_dict) -> bool:
-    """Return True if any tensor in the state dict contains NaN or Inf."""
     for v in state_dict.values():
         if isinstance(v, dict):
             if _state_dict_has_invalid(v):
@@ -110,7 +171,6 @@ def _state_dict_has_invalid(state_dict) -> bool:
 
 
 def _saes_have_invalid(saes: nn.ModuleList) -> bool:
-    """Return True if any SAE parameter contains NaN or Inf."""
     for sae in saes:
         if _state_dict_has_invalid(sae.state_dict()):
             return True
@@ -118,8 +178,6 @@ def _saes_have_invalid(saes: nn.ModuleList) -> bool:
 
 
 def _load_one_checkpoint(ckpt_dir: Path, saes: nn.ModuleList, optimizers, device, dtype):
-    """Load a single checkpoint directory. Returns parsed state or raises on failure/NaN."""
-    # SAE weights
     for i, sae in enumerate(saes):
         path = ckpt_dir / f"layer_{i}.pt"
         if not path.exists():
@@ -138,44 +196,59 @@ def _load_one_checkpoint(ckpt_dir: Path, saes: nn.ModuleList, optimizers, device
     optimizer_states = torch.load(
         ckpt_dir / "optimizer_states.pt", map_location="cpu", weights_only=False
     )
-
-    # restore optimizer states into existing optimizer objects
     for opt, opt_state in zip(optimizers, optimizer_states):
         opt.load_state_dict(opt_state)
 
     return saved_step, sparsity_coeffs, log
 
 
+def load_checkpoint(capture_name: str, saes: nn.ModuleList, optimizers, device, dtype):
+    roots = {
+        "latest": latest_checkpoint_dir(capture_name),
+        "prev": prev_checkpoint_dir(capture_name),
+    }
+    for name in ["latest", "prev"]:
+        ckpt_dir = roots[name]
+        if not ckpt_dir.exists():
+            continue
+        try:
+            print(f"  [{capture_name}] resuming from {name}")
+            saved_step, sparsity_coeffs, log = _load_one_checkpoint(
+                ckpt_dir, saes, optimizers, device, dtype
+            )
+            print(f"    resumed at step {saved_step}")
+            return saved_step, sparsity_coeffs, log
+        except Exception as e:
+            print(f"    failed to load {name}: {e}")
+    print(f"  [{capture_name}] no valid checkpoint, starting from scratch")
+    return None
+
+
 def save_checkpoint(
-    capture_type: str,
+    capture_name: str,
     step: int,
     saes: nn.ModuleList,
     optimizers,
     sparsity_coeffs: list,
     log: list,
 ):
-    """Atomically save a resumable checkpoint, keeping the previous one as `prev`."""
-    ckpt_dir = latest_checkpoint_dir(capture_type)
-    prev_dir = prev_checkpoint_dir(capture_type)
+    ckpt_dir = latest_checkpoint_dir(capture_name)
+    prev_dir = prev_checkpoint_dir(capture_name)
     tmp_dir = ckpt_dir.with_suffix(".tmp")
     tmp_dir.mkdir(parents=True, exist_ok=True)
 
-    # SAE weights
     for i, sae in enumerate(saes):
         torch.save(sae.state_dict(), tmp_dir / f"layer_{i}.pt")
 
-    # optimizer states (move to CPU before saving to keep checkpoint small)
     states_to_save = [state_dict_to_cpu(opt.state_dict()) for opt in optimizers]
     torch.save(states_to_save, tmp_dir / "optimizer_states.pt")
 
-    # everything else needed to resume exactly
     torch.save({
         "step": step,
         "sparsity_coeffs": sparsity_coeffs,
         "log": log,
     }, tmp_dir / "training_state.pt")
 
-    # rotate: latest -> prev, then tmp -> latest
     if prev_dir.exists():
         shutil.rmtree(prev_dir)
     if ckpt_dir.exists():
@@ -183,68 +256,37 @@ def save_checkpoint(
     tmp_dir.rename(ckpt_dir)
 
 
-def load_checkpoint(capture_type: str, saes: nn.ModuleList, optimizers, device, dtype):
-    """Load the latest valid checkpoint, falling back to prev if latest is corrupt."""
-    roots = {
-        "latest": latest_checkpoint_dir(capture_type),
-        "prev": prev_checkpoint_dir(capture_type),
-    }
-
-    for name in checkpoint_dir_order():
-        ckpt_dir = roots[name]
-        if not ckpt_dir.exists():
-            continue
-        try:
-            print(f"resuming from checkpoint: {ckpt_dir}")
-            saved_step, sparsity_coeffs, log = _load_one_checkpoint(
-                ckpt_dir, saes, optimizers, device, dtype
-            )
-            print(f"  resumed at step {saved_step}")
-            print_vram("after resume load")
-            return saved_step, sparsity_coeffs, log
-        except Exception as e:
-            print(f"  failed to load {name}: {e}")
-
-    print("no valid checkpoint found, starting from scratch")
-    return None
-
-
 # =========================================================================================
-# activation capture hooks
+# capture group (one per output type)
 # =========================================================================================
 
-def register_capture_hooks(model: Qwen3_5ForCausalLM, capture_type: str):
-    """Register forward hooks that copy the chosen activations to CPU RAM."""
-    captured = {}
+@dataclass
+class CaptureGroup:
+    name: str
+    saes: nn.ModuleList
+    optimizers: list
+    sparsity_coeffs: list
+    log: list
+    train_log: list
+    start_step: int
 
-    def make_hook(layer_idx: int):
-        def hook(module, input, output):
-            # modules may return tuples; take first element
-            tensor = output[0] if isinstance(output, tuple) else output
-            # offload immediately so VRAM doesn't accumulate 32 layer outputs
-            captured[layer_idx] = tensor.detach().cpu()
-        return hook
 
-    text_model = model.model.language_model
-    for i, layer in enumerate(text_model.layers):
-        if capture_type == "residue":
-            # full layer output: after attention/MLP residual adds
-            layer.register_forward_hook(make_hook(i))
-        elif capture_type == "post_attn_norm":
-            # full-attention subblock output, before residual add
-            if hasattr(layer, "self_attn"):
-                layer.self_attn.register_forward_hook(make_hook(i))
-        elif capture_type == "post_linear_attn_norm":
-            # linear-attention subblock output, before residual add
-            if hasattr(layer, "linear_attn"):
-                layer.linear_attn.register_forward_hook(make_hook(i))
-        elif capture_type == "post_mlp_norm":
-            # MLP subblock output, before residual add
-            layer.mlp.register_forward_hook(make_hook(i))
-        else:
-            raise ValueError(f"unknown capture_type: {capture_type}")
-
-    return captured
+def build_capture_group(name: str, num_layers: int, hidden_size: int, device, dtype):
+    saes = nn.ModuleList([
+        SAE(hidden_size, EXPANSION_FACTOR, band_eps=BAND_EPS)
+        for _ in range(num_layers)
+    ]).to(device).to(dtype)
+    optimizers = [make_optimizer(sae, LEARNING_RATE) for sae in saes]
+    sparsity_coeffs = [SPARSITY_COEFF_INIT for _ in saes]
+    return CaptureGroup(
+        name=name,
+        saes=saes,
+        optimizers=optimizers,
+        sparsity_coeffs=sparsity_coeffs,
+        log=[],
+        train_log=[],
+        start_step=0,
+    )
 
 
 # =========================================================================================
@@ -262,37 +304,38 @@ def main(
         print("CUDA not available, falling back to CPU")
         device = torch.device("cpu")
 
-    # ---- build SAEs (random init; overwritten by checkpoint if resuming) ----
     config = Qwen3_5Config()
     text_cfg = config.text_config
     hidden_size = text_cfg.hidden_size
     num_layers = text_cfg.num_hidden_layers
-    print(f"building {num_layers} SAEs for {CAPTURE_TYPE}...")
-    saes = nn.ModuleList([
-        SAE(hidden_size, EXPANSION_FACTOR, band_eps=BAND_EPS)
-        for _ in range(num_layers)
-    ]).to(device).to(dtype)
-    print_vram("after building SAEs")
 
-    # ---- build optimizers (bind to SAE params; state paged to CPU if PagedAdamW8bit) ----
-    print("building optimizers...")
-    optimizers = [make_optimizer(sae, LEARNING_RATE) for sae in saes]
-    print(f"optimizer class: {type(optimizers[0]).__name__}")
-    print_vram("after building optimizers")
+    specs = get_capture_specs(CAPTURE_TYPE)
+    print(f"capture type: {CAPTURE_TYPE}")
+    print(f"  training: {', '.join(name for name, _ in specs)}")
 
-    sparsity_coeffs = [SPARSITY_COEFF_INIT for _ in saes]
-    log = []
-    train_log = []
-    start_step = 0
+    # ---- build capture groups ----
+    groups = []
+    for name, _ in specs:
+        print(f"\nbuilding {num_layers} SAEs for {name}...")
+        group = build_capture_group(name, num_layers, hidden_size, device, dtype)
+        print(f"optimizer class: {type(group.optimizers[0]).__name__}")
+        print_vram(f"after building {name}")
+        groups.append(group)
 
-    # ---- try to resume before loading the heavy model ----
-    loaded = load_checkpoint(CAPTURE_TYPE, saes, optimizers, device, dtype)
-    if loaded is not None:
-        saved_step, sparsity_coeffs, log = loaded
-        start_step = saved_step + 1
+    # ---- resume before loading the heavy model ----
+    print("\nresuming checkpoints...")
+    for group in groups:
+        loaded = load_checkpoint(group.name, group.saes, group.optimizers, device, dtype)
+        if loaded is not None:
+            saved_step, group.sparsity_coeffs, group.log = loaded
+            group.start_step = saved_step + 1
+
+    start_step = min((g.start_step for g in groups), default=0)
+    if len(set(g.start_step for g in groups)) > 1:
+        print(f"warning: capture groups have different resume steps; using min {start_step}")
 
     # ---- load model ----
-    print("loading model...")
+    print("\nloading model...")
     model = Qwen3_5ForCausalLM(config)
     load_weights(model, "weights", device=device, dtype=dtype, strict=True)
     model.to(device)
@@ -300,8 +343,10 @@ def main(
     print("model loaded")
     print_vram("after model load")
 
-    # ---- register hooks ----
-    captured = register_capture_hooks(model, CAPTURE_TYPE)
+    # ---- register hooks for all capture groups ----
+    captured = {}
+    for name, register_fn in specs:
+        register_fn(model, captured)
 
     # ---- load token bin ----
     bin_path = TOKENIZED_DIR / "tokenized_interpmix.bin"
@@ -315,17 +360,18 @@ def main(
     num_chunks = len(all_tokens) // CHUNK_SIZE
     if num_chunks == 0:
         raise ValueError(f"no full {CHUNK_SIZE}-token chunks in {bin_path}")
-    print(f"tokens: {len(all_tokens):,}, chunks: {num_chunks:,}")
+    print(f"\ntokens: {len(all_tokens):,}, chunks: {num_chunks:,}")
 
-    # ---- training loop ----
     max_steps = num_chunks // BATCH_SIZE
     if MAX_TRAIN_CHUNKS is not None:
         max_steps = min(max_steps, MAX_TRAIN_CHUNKS // BATCH_SIZE)
     print(f"training up to {max_steps:,} steps (~{max_steps * BATCH_SIZE * CHUNK_SIZE / 1e9:.2f}B tokens)...")
+
+    # ---- training loop ----
+    print("training...")
     start_time = time.time()
 
     for step in range(start_step, max_steps):
-        # build batch
         batch_start = step * BATCH_SIZE * CHUNK_SIZE
         batch_end = batch_start + BATCH_SIZE * CHUNK_SIZE
         if batch_end > len(all_tokens):
@@ -333,24 +379,25 @@ def main(
 
         batch_ids = torch.from_numpy(all_tokens[batch_start:batch_end]).view(BATCH_SIZE, CHUNK_SIZE).to(device)
 
-        # forward pass, capture activations to CPU (no KV cache needed for training)
         with torch.no_grad():
             _ = model(input_ids=batch_ids, use_cache=False)
 
-        # train each layer's SAE one at a time
-        for i, sae in enumerate(saes):
-            if i not in captured:
-                continue
+        # train each captured activation
+        for key in list(captured.keys()):
+            capture_name, layer_idx = key
+            acts = captured[key].to(device).to(dtype)
+            acts = acts.view(-1, acts.shape[-1])
 
-            acts = captured[i].to(device).to(dtype)  # (B, L, D)
-            acts = acts.view(-1, acts.shape[-1])     # (B*L, D)
+            group = next(g for g in groups if g.name == capture_name)
+            sae = group.saes[layer_idx]
+            opt = group.optimizers[layer_idx]
 
-            sparsity_coeffs[i], loss, l0, recon = train_SAE(
+            group.sparsity_coeffs[layer_idx], loss, l0, recon = train_SAE(
                 sae,
                 acts,
-                optimizers[i],
+                opt,
                 TARGET_ACTIVE,
-                sparsity_coeffs[i],
+                group.sparsity_coeffs[layer_idx],
                 clip_grad_norm=CLIP_GRAD_NORM,
                 clip_grad_value=CLIP_GRAD_VALUE,
             )
@@ -358,58 +405,65 @@ def main(
             del acts
 
             if step % LOG_EVERY == 0 and step > 0:
-                log.append({
+                group.log.append({
                     "step": step,
-                    "layer": i,
+                    "layer": layer_idx,
                     "loss": loss,
                     "l0": l0,
                     "recon": recon,
-                    "sparsity_coeff": sparsity_coeffs[i],
+                    "sparsity_coeff": group.sparsity_coeffs[layer_idx],
                 })
 
-        # checkpoint (overwrites `latest`)
+        # checkpoint all groups
         if step % CHECKPOINT_EVERY == 0 and step > 0:
-            save_checkpoint(
-                CAPTURE_TYPE,
-                step,
-                saes,
-                optimizers,
-                sparsity_coeffs,
-                log,
-            )
-            print(f"saved checkpoint at step {step}")
+            for group in groups:
+                save_checkpoint(
+                    group.name,
+                    step,
+                    group.saes,
+                    group.optimizers,
+                    group.sparsity_coeffs,
+                    group.log,
+                )
+                print(f"  saved {group.name} checkpoint at step {step}")
 
         if step % LOG_EVERY == 0 and step > 0:
             elapsed = time.time() - start_time
             tok_per_sec = (step * BATCH_SIZE * CHUNK_SIZE) / elapsed
-            print(
-                f"step {step} | tok/s: {tok_per_sec:,.0f} | elapsed: {elapsed/3600:.2f}h | "
-                f"recon: {recon:.6f} | sparsity: {l0:.6f}"
-            )
+            parts = [f"step {step} | tok/s: {tok_per_sec:,.0f} | elapsed: {elapsed/3600:.2f}h"]
+            for group in groups:
+                # recon/l0 from last trained layer of this group in this step
+                last_entry = group.log[-1] if group.log and group.log[-1]["step"] == step else None
+                if last_entry:
+                    parts.append(f"{group.name}: recon={last_entry['recon']:.6f} sparsity={last_entry['l0']:.6f}")
+            print(" | ".join(parts))
             print_vram("log")
 
-            train_log.append({
-                "time": datetime.datetime.now().isoformat(),
-                "batch": step,
-                "tok_per_sec": tok_per_sec,
-                "recon": recon,
-                "sparsity": l0,
-            })
-            train_log_path = SAE_WEIGHTS_DIR / CAPTURE_TYPE / "train_log.json"
-            with open(train_log_path, "w") as f:
-                json.dump(train_log, f, indent=2)
+            for group in groups:
+                last_entry = group.log[-1] if group.log and group.log[-1]["step"] == step else None
+                if last_entry:
+                    group.train_log.append({
+                        "time": datetime.datetime.now().isoformat(),
+                        "batch": step,
+                        "tok_per_sec": tok_per_sec,
+                        "recon": last_entry["recon"],
+                        "sparsity": last_entry["l0"],
+                    })
+                    train_log_path = SAE_WEIGHTS_DIR / group.name / "train_log.json"
+                    with open(train_log_path, "w") as f:
+                        json.dump(group.train_log, f, indent=2)
 
-        # clear CPU activation cache before the next forward
         captured.clear()
 
     # ---- final save ----
-    final_dir = SAE_WEIGHTS_DIR / CAPTURE_TYPE / "final"
-    final_dir.mkdir(parents=True, exist_ok=True)
-    for i, sae in enumerate(saes):
-        torch.save(sae.state_dict(), final_dir / f"layer_{i}.pt")
+    for group in groups:
+        final_dir = SAE_WEIGHTS_DIR / group.name / "final"
+        final_dir.mkdir(parents=True, exist_ok=True)
+        for i, sae in enumerate(group.saes):
+            torch.save(sae.state_dict(), final_dir / f"layer_{i}.pt")
 
-    with open(final_dir / "log.json", "w") as f:
-        json.dump(log, f)
+        with open(final_dir / "log.json", "w") as f:
+            json.dump(group.log, f)
 
     total_time = time.time() - start_time
     print(f"done in {total_time/3600:.2f}h")

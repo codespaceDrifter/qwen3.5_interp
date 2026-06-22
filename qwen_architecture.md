@@ -40,6 +40,12 @@ Qwen3.5-4B dimensions:
             └──────────┬───────────┘
                        │ (B, T, 2560)
                        ▼
+        ┌──────────────────────────────┐
+        │  Qwen3_5TextRotaryEmbedding  │  (MRoPE; text: 3 identical grids)
+        │  position_ids ──► cos, sin   │
+        └──────────┬───────────────────┘
+                   │ position_embeddings
+                   ▼
           residual ──► [Qwen3_5DecoderLayer 0]
                            │
                            ▼
@@ -79,9 +85,9 @@ No PLE, no layer scalars, no vision/audio in this text-only implementation.
                 ▼
         ┌───────────────────────────────┐
         │  Qwen3_5Attention             │  (layers 3, 7, 11, ...)
-        │  full_attn                    │
+        │  full_attn                    │◄──── position_embeddings (cos, sin)
         │  OR                           │
-        │  Qwen3_5GatedDeltaNet         │  (all other layers)
+        │  Qwen3_5GatedDeltaNet         │  (all other layers; no RoPE)
         │  linear_attn                  │
         │  └─ Qwen3_5RMSNormGated       │
         └───────┬───────────────────────┘
