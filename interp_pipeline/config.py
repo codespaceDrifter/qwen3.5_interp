@@ -51,6 +51,10 @@ BAND_EPS = 0.001
 CHECKPOINT_EVERY = 100     # chunks
 LOG_EVERY = 100            # chunks
 
+# cap training at ~1B tokens for cost reasons. 1,000,000 chunks * 1024 tokens ≈ 1.024B tokens.
+# set to None to train on the whole dataset.
+MAX_TRAIN_CHUNKS = 1_000_000
+
 # gradient clipping. None disables.
 # CLIP_GRAD_NORM clips the total L2 norm of all gradients together.
 # CLIP_GRAD_VALUE clips each gradient element individually to [-value, value].

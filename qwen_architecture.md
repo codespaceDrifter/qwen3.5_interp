@@ -33,30 +33,33 @@ Qwen3.5-4B dimensions:
               input_ids (B, T)
                    │
                    ▼
-            ┌──────────────┐
-            │ embed_tokens │  (tied to lm_head)
-            │              │
-            └──────┬───────┘
-                   │ (B, T, 2560)
-                   ▼
-      residual ──► [decoder layer 0]
-                       │
+            ┌──────────────────────┐
+            │   nn.Embedding       │
+            │   embed_tokens       │  (tied to lm_head)
+            │                      │
+            └──────────┬───────────┘
+                       │ (B, T, 2560)
                        ▼
-                   [decoder layer 1]
-                       │
-                      ...
-                       │
-                   [decoder layer 31]
-                       │
-                       ▼
-                 ┌───────────┐
-                 │ final norm│
-                 └─────┬─────┘
-                       ▼
-                 ┌───────────┐
-                 │  lm_head  │  (tied to embed_tokens)
-                 └─────┬─────┘
-                       ▼
+          residual ──► [Qwen3_5DecoderLayer 0]
+                           │
+                           ▼
+                      [Qwen3_5DecoderLayer 1]
+                           │
+                          ...
+                           │
+                      [Qwen3_5DecoderLayer 31]
+                           │
+                           ▼
+                 ┌─────────────────────┐
+                 │  Qwen3_5RMSNorm     │
+                 │  final norm         │
+                 └──────────┬──────────┘
+                            ▼
+                 ┌─────────────────────┐
+                 │  nn.Linear          │
+                 │  lm_head            │  (tied to embed_tokens)
+                 └──────────┬──────────┘
+                            ▼
                  logits (B, T, 248320)
 ```
 
@@ -69,27 +72,32 @@ No PLE, no layer scalars, no vision/audio in this text-only implementation.
 ```
          residual_in (B, T, 2560)
                 │
-        ┌───────▼───────┐
-        │ input_layernorm│
-        └───────┬───────┘
+        ┌───────▼─────────────────┐
+        │  Qwen3_5RMSNorm         │
+        │  input_layernorm        │
+        └───────┬─────────────────┘
                 ▼
-        ┌───────────────┐
-        │  full_attn    │  (layers 3, 7, 11, ...)
-        │  OR           │
-        │  linear_attn  │  (Gated DeltaNet; all other layers)
-        └───────┬───────┘
+        ┌───────────────────────────────┐
+        │  Qwen3_5Attention             │  (layers 3, 7, 11, ...)
+        │  full_attn                    │
+        │  OR                           │
+        │  Qwen3_5GatedDeltaNet         │  (all other layers)
+        │  linear_attn                  │
+        │  └─ Qwen3_5RMSNormGated       │
+        └───────┬───────────────────────┘
                 │
         residual┤
                 ▼
-        ┌───────────────┐
-        │post_attention_│
-        │  layernorm    │
-        └───────┬───────┘
+        ┌───────▼─────────────────┐
+        │  Qwen3_5RMSNorm         │
+        │  post_attention_layernorm│
+        └───────┬─────────────────┘
                 ▼
-        ┌───────────────┐
-        │      mlp      │
-        │ SwiGLU, no bias│
-        └───────┬───────┘
+        ┌─────────────────────────┐
+        │  Qwen3_5MLP             │
+        │  mlp                    │
+        │  SwiGLU, no bias        │
+        └───────┬─────────────────┘
                 │
         residual┤
                 ▼

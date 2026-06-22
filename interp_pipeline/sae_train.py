@@ -36,6 +36,7 @@ from interp_pipeline.config import (
     EXPANSION_FACTOR,
     LEARNING_RATE,
     LOG_EVERY,
+    MAX_TRAIN_CHUNKS,
     PAGE_OPTIMIZERS,
     SAE_DTYPE,
     SAE_WEIGHTS_DIR,
@@ -317,10 +318,13 @@ def main(
     print(f"tokens: {len(all_tokens):,}, chunks: {num_chunks:,}")
 
     # ---- training loop ----
-    print("training...")
+    max_steps = num_chunks // BATCH_SIZE
+    if MAX_TRAIN_CHUNKS is not None:
+        max_steps = min(max_steps, MAX_TRAIN_CHUNKS // BATCH_SIZE)
+    print(f"training up to {max_steps:,} steps (~{max_steps * BATCH_SIZE * CHUNK_SIZE / 1e9:.2f}B tokens)...")
     start_time = time.time()
 
-    for step in range(start_step, num_chunks // BATCH_SIZE):
+    for step in range(start_step, max_steps):
         # build batch
         batch_start = step * BATCH_SIZE * CHUNK_SIZE
         batch_end = batch_start + BATCH_SIZE * CHUNK_SIZE

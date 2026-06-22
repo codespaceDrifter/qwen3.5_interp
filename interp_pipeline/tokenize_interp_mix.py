@@ -127,11 +127,21 @@ def main():
 
     dropped_tokens = len(buffer)
 
-    print(f"\n=== DONE ===")
+    print(f"\n=== DONE tokenizing ===")
     print(f"  total docs: {total_docs:,}")
     print(f"  total tokens: {total_tokens:,}")
     print(f"  full chunks: {full_chunks:,}")
     print(f"  dropped remainder: {dropped_tokens:,} tokens")
+
+    # shuffle chunks in-place so the .bin is already randomized
+    if full_chunks > 1:
+        print("\nshuffling chunks...")
+        rng = np.random.default_rng(42)
+        flat = np.fromfile(out_bin, dtype=TOKEN_DTYPE)
+        chunks = flat.reshape(full_chunks, CHUNK_SIZE)
+        rng.shuffle(chunks)
+        chunks.tofile(out_bin)
+        print(f"  shuffled {full_chunks:,} chunks")
 
     manifest = {
         "tokenizer": str(tokenizer_path),
