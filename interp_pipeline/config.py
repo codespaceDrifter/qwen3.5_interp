@@ -44,13 +44,10 @@ CAPTURE_TYPE = "attention"
 
 EXPANSION_FACTOR = 16
 BATCH_SIZE = 16
-LEARNING_RATE = 1e-4
+LEARNING_RATE = 5e-3
 TARGET_ACTIVE = 64
 SPARSITY_COEFF_INIT = 1e-3
 BAND_EPS = 0.001
-
-# EXPERIMENT: set True to train with reconstruction loss only (sparsity loss disabled).
-DELETE_SPARSITY_EXPERIMENT = True
 
 CHECKPOINT_EVERY = 100     # chunks
 LOG_EVERY = 100            # chunks

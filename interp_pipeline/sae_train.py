@@ -39,7 +39,6 @@ from interp_pipeline.config import (
     CHUNK_SIZE,
     CLIP_GRAD_NORM,
     CLIP_GRAD_VALUE,
-    DELETE_SPARSITY_EXPERIMENT,
     DEVICE,
     EXPANSION_FACTOR,
     LEARNING_RATE,
@@ -418,7 +417,6 @@ def main(
                 group.sparsity_coeffs[layer_idx],
                 clip_grad_norm=CLIP_GRAD_NORM,
                 clip_grad_value=CLIP_GRAD_VALUE,
-                disable_sparsity=DELETE_SPARSITY_EXPERIMENT,
             )
 
             del acts

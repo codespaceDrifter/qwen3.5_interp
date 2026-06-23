@@ -76,26 +76,21 @@ def train_SAE (
     sparsity_coeff,
     clip_grad_norm=None,
     clip_grad_value=None,
-    disable_sparsity: bool = False,
 ):
     features, combined_gate = sae.encode(activation)
 
-    if disable_sparsity:
-        # reconstruction-only experiment: skip all sparsity loss / coefficient adaptation
-        l0_loss = activation.new_tensor(0.0)
-        unweighted_l0_loss = activation.new_tensor(0.0)
-    else:
-        # avg number of active features per token minus the target
-        error = (combined_gate.sum(-1) - target_active).mean()
-        # adapt the sparsity coefficient: increase if too many features fire, decrease if too few
-        sparsity_coeff *= (1 + 0.01 * ( 1 if error.item() > 0 else -1 ))
-        # unweighted loss = how far over target we are (zero if under target)
-        unweighted_l0_loss = torch.clamp(error, min=0)
-        # weighted loss = what actually gets added to the total loss
-        l0_loss = unweighted_l0_loss * sparsity_coeff
+    # avg number of active features per token minus the target
+    error = (combined_gate.sum(-1) - target_active).mean()
+    # adapt the sparsity coefficient: increase if too many features fire, decrease if too few
+    sparsity_coeff *= (1 + 0.01 * ( 1 if error.item() > 0 else -1 ))
+    # unweighted loss = how far over target we are (zero if under target)
+    unweighted_l0_loss = torch.clamp(error, min=0)
+    # weighted loss = what actually gets added to the total loss
+    l0_loss = unweighted_l0_loss * sparsity_coeff
 
     pred = sae.decode(features)
-    recon_loss = (pred-activation).pow(2).sum(-1).mean()
+    # average squared error over both tokens and embedding dimensions (per-coordinate MSE)
+    recon_loss = (pred - activation).pow(2).mean()
     loss = l0_loss + recon_loss
 
     optimizer.zero_grad()
