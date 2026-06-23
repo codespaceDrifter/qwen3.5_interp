@@ -40,12 +40,12 @@ TOKEN_DTYPE = "int32"
 #   "linear_attn_out" = linear attention / Gated DeltaNet subblock output
 #   "mlp_out"         = MLP subblock output
 #   "attention"       = trains attn_out + linear_attn_out in one run
-CAPTURE_TYPE = "attention"
+CAPTURE_TYPE = "residue"
 
 # which SAE architecture to train:
 #   "gated" = your custom GatedSAE (JumpReLU + cone gates)
 #   "topk"  = standard top-K SAE (sparsity enforced structurally, no sparsity loss)
-SAE_TYPE = "gated"
+SAE_TYPE = "topk"
 
 EXPANSION_FACTOR = 16
 BATCH_SIZE = 16
