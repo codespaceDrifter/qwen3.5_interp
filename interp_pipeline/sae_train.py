@@ -39,6 +39,7 @@ from interp_pipeline.config import (
     CHUNK_SIZE,
     CLIP_GRAD_NORM,
     CLIP_GRAD_VALUE,
+    DELETE_SPARSITY_EXPERIMENT,
     DEVICE,
     EXPANSION_FACTOR,
     LEARNING_RATE,
@@ -131,7 +132,11 @@ def register_mlp_hooks(model: Qwen3_5ForCausalLM, captured: dict):
 
 
 def get_capture_specs(capture_type: str) -> list:
-    """Return the list of capture specs to train for a given CAPTURE_TYPE."""
+    """Return the list of capture specs to train for a given CAPTURE_TYPE.
+
+    Each spec is (name, hook_registration_function). CAPTURE_TYPE="attention"
+    returns two specs so both attention types train in one run.
+    """
     specs = {
         "residue": [("residue", register_residue_hooks)],
         "attn_out": [("attn_out", register_attn_hooks)],
@@ -249,6 +254,8 @@ def save_checkpoint(
         "log": log,
     }, tmp_dir / "training_state.pt")
 
+    # rotate: old latest becomes prev, then temp becomes latest.
+    # this gives us one backup checkpoint in case latest is corrupt.
     if prev_dir.exists():
         shutil.rmtree(prev_dir)
     if ckpt_dir.exists():
@@ -260,6 +267,9 @@ def save_checkpoint(
 # capture group (one per output type)
 # =========================================================================================
 
+# A CaptureGroup holds all state for one SAE output type (e.g. "attn_out").
+# When CAPTURE_TYPE="attention" we run two groups (attn_out + linear_attn_out)
+# in a single training pass, sharing the model forward.
 @dataclass
 class CaptureGroup:
     name: str
@@ -272,10 +282,12 @@ class CaptureGroup:
 
 
 def build_capture_group(name: str, num_layers: int, hidden_size: int, device, dtype):
+    # one SAE per layer; all 32 live on GPU
     saes = nn.ModuleList([
         SAE(hidden_size, EXPANSION_FACTOR, band_eps=BAND_EPS)
         for _ in range(num_layers)
     ]).to(device).to(dtype)
+    # one optimizer per SAE; PagedAdamW8bit keeps most state in CPU RAM
     optimizers = [make_optimizer(sae, LEARNING_RATE) for sae in saes]
     sparsity_coeffs = [SPARSITY_COEFF_INIT for _ in saes]
     return CaptureGroup(
@@ -323,6 +335,8 @@ def main(
         groups.append(group)
 
     # ---- resume before loading the heavy model ----
+    # each capture group loads its own checkpoint independently.
+    # for combined attention both groups should have the same saved step.
     print("\nresuming checkpoints...")
     for group in groups:
         loaded = load_checkpoint(group.name, group.saes, group.optimizers, device, dtype)
@@ -330,6 +344,8 @@ def main(
             saved_step, group.sparsity_coeffs, group.log = loaded
             group.start_step = saved_step + 1
 
+    # combined mode: both groups saved together, but if they differ use the
+    # smaller step so no group misses batches.
     start_step = min((g.start_step for g in groups), default=0)
     if len(set(g.start_step for g in groups)) > 1:
         print(f"warning: capture groups have different resume steps; using min {start_step}")
@@ -382,7 +398,9 @@ def main(
         with torch.no_grad():
             _ = model(input_ids=batch_ids, use_cache=False)
 
-        # train each captured activation
+        # train each captured activation. `captured` keys are (capture_name, layer_idx).
+        # in single-type mode only one capture_name is present; in "attention" mode
+        # both attn_out and linear_attn_out keys appear.
         for key in list(captured.keys()):
             capture_name, layer_idx = key
             acts = captured[key].to(device).to(dtype)
@@ -392,7 +410,7 @@ def main(
             sae = group.saes[layer_idx]
             opt = group.optimizers[layer_idx]
 
-            group.sparsity_coeffs[layer_idx], loss, l0, recon = train_SAE(
+            group.sparsity_coeffs[layer_idx], loss, l0, recon, unweighted_l0 = train_SAE(
                 sae,
                 acts,
                 opt,
@@ -400,6 +418,7 @@ def main(
                 group.sparsity_coeffs[layer_idx],
                 clip_grad_norm=CLIP_GRAD_NORM,
                 clip_grad_value=CLIP_GRAD_VALUE,
+                disable_sparsity=DELETE_SPARSITY_EXPERIMENT,
             )
 
             del acts
@@ -410,6 +429,7 @@ def main(
                     "layer": layer_idx,
                     "loss": loss,
                     "l0": l0,
+                    "unweighted_l0": unweighted_l0,
                     "recon": recon,
                     "sparsity_coeff": group.sparsity_coeffs[layer_idx],
                 })
@@ -435,7 +455,11 @@ def main(
                 # recon/l0 from last trained layer of this group in this step
                 last_entry = group.log[-1] if group.log and group.log[-1]["step"] == step else None
                 if last_entry:
-                    parts.append(f"{group.name}: recon={last_entry['recon']:.6f} sparsity={last_entry['l0']:.6f}")
+                    parts.append(
+                        f"{group.name}: recon={last_entry['recon']:.6f} "
+                        f"sparsity={last_entry['l0']:.6f} "
+                        f"uw_sparsity={last_entry['unweighted_l0']:.6f}"
+                    )
             print(" | ".join(parts))
             print_vram("log")
 
@@ -448,6 +472,7 @@ def main(
                         "tok_per_sec": tok_per_sec,
                         "recon": last_entry["recon"],
                         "sparsity": last_entry["l0"],
+                        "unweighted_sparsity": last_entry["unweighted_l0"],
                     })
                     train_log_path = SAE_WEIGHTS_DIR / group.name / "train_log.json"
                     with open(train_log_path, "w") as f:

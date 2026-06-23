@@ -1,19 +1,10 @@
 # Tiny wrapper around the HF `tokenizer.json` format for Qwen3.5.
 
-try:
-    from tokenizers import Tokenizer
-
-    _HAS_TOKENIZERS = True
-except Exception:  # pragma: no cover
-    _HAS_TOKENIZERS = False
+from tokenizers import Tokenizer
 
 
 class QwenTokenizer:
     def __init__(self, tokenizer_path: str = "weights/tokenizer.json"):
-        if not _HAS_TOKENIZERS:
-            raise ImportError(
-                "the `tokenizers` package is required to load tokenizer.json"
-            )
         self.tok = Tokenizer.from_file(str(tokenizer_path))
 
         self.im_start = "<|im_start|>"
@@ -44,7 +35,7 @@ class QwenTokenizer:
             parts.append(f"{self.im_start}system\n{system}{self.im_end}\n")
         for msg in messages:
             role = msg.get("role", "user")
-            content = msg.get("content", "")
+            content = msg.get("content", "" )
             parts.append(f"{self.im_start}{role}\n{content}{self.im_end}\n")
         if add_generation_prompt:
             parts.append(f"{self.im_start}assistant\n")

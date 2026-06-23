@@ -77,3 +77,8 @@ Residue→MLP-out feature tables using SAEs or WCCs.
 - `pyarrow` for reading the `.arrow` interp mix
 - FastAPI + Uvicorn if/when we add a web backend
 - Pure HTML/CSS/JS frontend if/when we add a web UI
+
+
+## notes / future cleanup
+
+- `qwen3_5_4b_implementation/loader.py` is overcomplicated. It defensively remaps HF keys because the model implementation doesn't perfectly mirror HF naming, and it manually drops vision-tower weights. When vision support is added later, the loader should be refactored to rely on exact key matching.

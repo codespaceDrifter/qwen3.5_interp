@@ -1,7 +1,10 @@
 import torch
 import torch.nn as nn
 
-# jumprelu, upper lower bound, cone gate, l0 loss  
+# Sparse autoencoder with:
+#   - JumpReLU-style slab gates (lower/upper bounds on feature pre-activations)
+#   - Cone gate via angle between input and encoder directions
+#   - Straight-through estimator so backprop flows through hard gates
 
 class SAE (nn.Module):
     def __init__(self, embed_dim, expansion_factor, band_eps = 0.001):
@@ -37,16 +40,22 @@ class SAE (nn.Module):
 
     def encode (self, input):
         input = input.to(self.encoder_weight.dtype)
+
+        # feature pre-activations: project centered input onto encoder directions
         pre_gate_features = (input - self.decoder_bias) @ self.encoder_weight.T + self.encoder_bias
 
+        # slab gates: keep features inside [lower_bound, upper_bound]
         slab_lower_gate = self.ste_gate(pre_gate_features, self.slab_gate_lower_bound, True)
         slab_upper_gate = self.ste_gate(pre_gate_features,self.slab_gate_upper_bound, False)
+
+        # cone gate: only keep features whose encoder direction is close to the input direction
         angles = torch.acos(
-            # (batch, feature_dim) / (batch, 1) / (feature_dim)
             ((input - self.decoder_bias) @ self.encoder_weight.T 
             / (input - self.decoder_bias).norm(dim=-1, keepdim=True) / self.encoder_weight.norm(dim=-1))
             .clamp(-1 + 1e-5, 1- 1e-5))
         cone_upper_gate = self.ste_gate(angles, self.cone_gate_upper_bound, False)
+
+        # all three gates must be on for a feature to fire
         combined_gate = slab_lower_gate * slab_upper_gate * cone_upper_gate
         features = pre_gate_features * combined_gate
         return features, combined_gate
@@ -58,6 +67,7 @@ class SAE (nn.Module):
 
 # trains SAE from streaming activations of the model
 # assumes a sparsity_coeff is initalized at 1e-3
+# returns: (updated_sparsity_coeff, total_loss, l0_loss, recon_loss)
 def train_SAE (
     sae:SAE,
     activation,
@@ -66,12 +76,23 @@ def train_SAE (
     sparsity_coeff,
     clip_grad_norm=None,
     clip_grad_value=None,
+    disable_sparsity: bool = False,
 ):
     features, combined_gate = sae.encode(activation)
 
-    error = (combined_gate.sum(-1) - target_active).mean()
-    sparsity_coeff *= (1 + 0.01 * ( 1 if error.item() > 0 else -1 ))
-    l0_loss = torch.clamp (error, min=0) * sparsity_coeff
+    if disable_sparsity:
+        # reconstruction-only experiment: skip all sparsity loss / coefficient adaptation
+        l0_loss = activation.new_tensor(0.0)
+        unweighted_l0_loss = activation.new_tensor(0.0)
+    else:
+        # avg number of active features per token minus the target
+        error = (combined_gate.sum(-1) - target_active).mean()
+        # adapt the sparsity coefficient: increase if too many features fire, decrease if too few
+        sparsity_coeff *= (1 + 0.01 * ( 1 if error.item() > 0 else -1 ))
+        # unweighted loss = how far over target we are (zero if under target)
+        unweighted_l0_loss = torch.clamp(error, min=0)
+        # weighted loss = what actually gets added to the total loss
+        l0_loss = unweighted_l0_loss * sparsity_coeff
 
     pred = sae.decode(features)
     recon_loss = (pred-activation).pow(2).sum(-1).mean()
@@ -88,4 +109,4 @@ def train_SAE (
     # keep decoder feature columns uniform
     with torch.no_grad():
         sae.decoder_weight /= sae.decoder_weight.norm (dim = 0, keepdim = True)
-    return sparsity_coeff, loss.item(), l0_loss.item(), recon_loss.item()
+    return sparsity_coeff, loss.item(), l0_loss.item(), recon_loss.item(), unweighted_l0_loss.item()

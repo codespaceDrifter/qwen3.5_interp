@@ -133,7 +133,9 @@ def main():
     print(f"  full chunks: {full_chunks:,}")
     print(f"  dropped remainder: {dropped_tokens:,} tokens")
 
-    # shuffle chunks in-place so the .bin is already randomized
+    # shuffle CHUNK_SIZE-token chunks in-place. this loads the whole bin into RAM,
+    # permutes rows (each row = one chunk), and overwrites the file. after this
+    # the .bin is already randomized, so training can read sequentially.
     if full_chunks > 1:
         print("\nshuffling chunks...")
         rng = np.random.default_rng(42)

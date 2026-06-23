@@ -15,13 +15,7 @@ import json
 from pathlib import Path
 
 import torch
-
-try:
-    from safetensors import safe_open
-
-    _HAS_SAFETENSORS = True
-except Exception:  # pragma: no cover
-    _HAS_SAFETENSORS = False
+from safetensors import safe_open
 
 from qwen3_5_4b_implementation.model import Qwen3_5ForCausalLM
 
@@ -48,7 +42,6 @@ def _resolve_checkpoint_paths(safetensors_path: str | Path) -> list[Path]:
 
     if path.is_file() and path.suffix == ".safetensors":
         return [path]
-
     directory = path if path.is_dir() else path.parent
     index_file = directory / "model.safetensors.index.json"
 
@@ -108,11 +101,6 @@ def load_weights(
     strict: bool = True,
 ):
     """Load a single safetensors checkpoint into ``model`` in-place."""
-    if not _HAS_SAFETENSORS:
-        raise ImportError(
-            "the `safetensors` package is required to load checkpoint weights"
-        )
-
     model_keys = set(model.state_dict().keys())
     tie_word_embeddings = getattr(model.config, "tie_word_embeddings", False)
 
