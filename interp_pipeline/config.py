@@ -50,7 +50,7 @@ SPARSITY_COEFF_INIT = 1e-3
 BAND_EPS = 0.001
 
 CHECKPOINT_EVERY = 100     # chunks
-LOG_EVERY = 100            # chunks
+LOG_EVERY = 10            # chunks
 
 # cap training at ~1B tokens for cost reasons. 1,000,000 chunks * 1024 tokens ≈ 1.024B tokens.
 # set to None to train on the whole shuffled bin.
