@@ -448,6 +448,7 @@ def main(
                 "active_count": entry["active_count"],
             })
             train_log_path = SAE_WEIGHTS_DIR / group.name / "train_log.json"
+            train_log_path.parent.mkdir(parents=True, exist_ok=True)
             with open(train_log_path, "w") as f:
                 json.dump(group.train_log, f, indent=2)
             plot_train_log(group.train_log, train_log_path.with_name("loss.png"))
