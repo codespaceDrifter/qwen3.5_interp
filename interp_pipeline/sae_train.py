@@ -61,7 +61,7 @@ from probes.TopKSAE import TopKSAE, train_TopKSAE
 # helpers
 # =========================================================================================
 
-def make_optimizer(sae: SAE, lr: float):
+def make_optimizer(sae: nn.Module, lr: float):
     """Build PagedAdamW8bit if available and configured, otherwise 8-bit/full AdamW."""
     try:
         import bitsandbytes as bnb
