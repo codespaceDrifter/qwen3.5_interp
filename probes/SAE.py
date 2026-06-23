@@ -67,7 +67,7 @@ class SAE (nn.Module):
 
 # trains SAE from streaming activations of the model
 # assumes a sparsity_coeff is initalized at 1e-3
-# returns: (updated_sparsity_coeff, total_loss, l0_loss, recon_loss)
+# returns: (updated_sparsity_coeff, total_loss, l0_loss, recon_loss, unweighted_l0_loss, recon_pct)
 def train_SAE (
     sae:SAE,
     activation,
@@ -91,6 +91,9 @@ def train_SAE (
     pred = sae.decode(features)
     # average squared error over both tokens and embedding dimensions (per-coordinate MSE)
     recon_loss = (pred - activation).pow(2).mean()
+    # percentage of activation energy not reconstructed
+    activation_energy = activation.pow(2).mean()
+    recon_pct = (recon_loss / activation_energy) * 100.0
     loss = l0_loss + recon_loss
 
     optimizer.zero_grad()
@@ -104,4 +107,4 @@ def train_SAE (
     # keep decoder feature columns uniform
     with torch.no_grad():
         sae.decoder_weight /= sae.decoder_weight.norm (dim = 0, keepdim = True)
-    return sparsity_coeff, loss.item(), l0_loss.item(), recon_loss.item(), unweighted_l0_loss.item()
+    return sparsity_coeff, loss.item(), l0_loss.item(), recon_loss.item(), unweighted_l0_loss.item(), recon_pct.item()

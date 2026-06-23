@@ -278,6 +278,7 @@ class CaptureGroup:
     log: list
     train_log: list
     start_step: int
+    log_layer_idx: int = 0
 
 
 def build_capture_group(name: str, num_layers: int, hidden_size: int, device, dtype):
@@ -297,6 +298,7 @@ def build_capture_group(name: str, num_layers: int, hidden_size: int, device, dt
         log=[],
         train_log=[],
         start_step=0,
+        log_layer_idx=0,
     )
 
 
@@ -386,6 +388,37 @@ def main(
     print("training...")
     start_time = time.time()
 
+    def log_metrics(step: int, groups: list):
+        """Log one layer per capture group, cycling through that group's actual layers."""
+        parts = [f"step {step}"]
+        for group in groups:
+            entries = [e for e in group.log if e["step"] == step]
+            if not entries:
+                continue
+            layers = sorted({e["layer"] for e in entries})
+            layer_idx = layers[group.log_layer_idx % len(layers)]
+            entry = next(e for e in entries if e["layer"] == layer_idx)
+            group.log_layer_idx += 1
+            parts.append(
+                f"{group.name}: recon={entry['recon']:.3f} "
+                f"recon_pct={entry['recon_pct']:.2f}% "
+                f"uw_sparsity={entry['unweighted_l0']:.3f} "
+                f"layer={entry['layer']}"
+            )
+            group.train_log.append({
+                "time": datetime.datetime.now().isoformat(),
+                "batch": step,
+                "layer": entry["layer"],
+                "recon": entry["recon"],
+                "recon_pct": entry["recon_pct"],
+                "unweighted_sparsity": entry["unweighted_l0"],
+            })
+            train_log_path = SAE_WEIGHTS_DIR / group.name / "train_log.json"
+            with open(train_log_path, "w") as f:
+                json.dump(group.train_log, f, indent=2)
+        print(" | ".join(parts))
+        print_vram("log")
+
     for step in range(start_step, max_steps):
         batch_start = step * BATCH_SIZE * CHUNK_SIZE
         batch_end = batch_start + BATCH_SIZE * CHUNK_SIZE
@@ -409,7 +442,7 @@ def main(
             sae = group.saes[layer_idx]
             opt = group.optimizers[layer_idx]
 
-            group.sparsity_coeffs[layer_idx], loss, l0, recon, unweighted_l0 = train_SAE(
+            group.sparsity_coeffs[layer_idx], loss, l0, recon, unweighted_l0, recon_pct = train_SAE(
                 sae,
                 acts,
                 opt,
@@ -429,6 +462,7 @@ def main(
                     "l0": l0,
                     "unweighted_l0": unweighted_l0,
                     "recon": recon,
+                    "recon_pct": recon_pct,
                     "sparsity_coeff": group.sparsity_coeffs[layer_idx],
                 })
 
@@ -446,35 +480,7 @@ def main(
                 print(f"  saved {group.name} checkpoint at step {step}")
 
         if step % LOG_EVERY == 0 and step > 0:
-            elapsed = time.time() - start_time
-            tok_per_sec = (step * BATCH_SIZE * CHUNK_SIZE) / elapsed
-            parts = [f"step {step} | tok/s: {tok_per_sec:,.0f} | elapsed: {elapsed/3600:.2f}h"]
-            for group in groups:
-                # recon/l0 from last trained layer of this group in this step
-                last_entry = group.log[-1] if group.log and group.log[-1]["step"] == step else None
-                if last_entry:
-                    parts.append(
-                        f"{group.name}: recon={last_entry['recon']:.6f} "
-                        f"sparsity={last_entry['l0']:.6f} "
-                        f"uw_sparsity={last_entry['unweighted_l0']:.6f}"
-                    )
-            print(" | ".join(parts))
-            print_vram("log")
-
-            for group in groups:
-                last_entry = group.log[-1] if group.log and group.log[-1]["step"] == step else None
-                if last_entry:
-                    group.train_log.append({
-                        "time": datetime.datetime.now().isoformat(),
-                        "batch": step,
-                        "tok_per_sec": tok_per_sec,
-                        "recon": last_entry["recon"],
-                        "sparsity": last_entry["l0"],
-                        "unweighted_sparsity": last_entry["unweighted_l0"],
-                    })
-                    train_log_path = SAE_WEIGHTS_DIR / group.name / "train_log.json"
-                    with open(train_log_path, "w") as f:
-                        json.dump(group.train_log, f, indent=2)
+            log_metrics(step, groups)
 
         captured.clear()
 
