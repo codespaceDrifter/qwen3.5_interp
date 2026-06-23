@@ -46,13 +46,15 @@ from interp_pipeline.config import (
     MAX_TRAIN_CHUNKS,
     PAGE_OPTIMIZERS,
     SAE_DTYPE,
+    SAE_TYPE,
     SAE_WEIGHTS_DIR,
     SPARSITY_COEFF_INIT,
     TARGET_ACTIVE,
     TOKENIZED_DIR,
     TOKEN_DTYPE,
 )
-from probes.SAE import SAE, train_SAE
+from probes.GatedSAE import GatedSAE, train_GatedSAE
+from probes.TopKSAE import TopKSAE, train_TopKSAE
 
 
 # =========================================================================================
@@ -282,9 +284,17 @@ class CaptureGroup:
 
 
 def build_capture_group(name: str, num_layers: int, hidden_size: int, device, dtype):
+    # pick SAE architecture from config
+    if SAE_TYPE == "topk":
+        sae_cls = TopKSAE
+        sae_kwargs = {}
+    else:
+        sae_cls = GatedSAE
+        sae_kwargs = {"band_eps": BAND_EPS}
+
     # one SAE per layer; all 32 live on GPU
     saes = nn.ModuleList([
-        SAE(hidden_size, EXPANSION_FACTOR, band_eps=BAND_EPS)
+        sae_cls(hidden_size, EXPANSION_FACTOR, **sae_kwargs)
         for _ in range(num_layers)
     ]).to(device).to(dtype)
     # one optimizer per SAE; PagedAdamW8bit keeps most state in CPU RAM
@@ -400,10 +410,10 @@ def main(
             entry = next(e for e in entries if e["layer"] == layer_idx)
             group.log_layer_idx += 1
             parts.append(
-                f"{group.name}: recon={entry['recon']:.3f} "
+                f"{group.name}: layer={entry['layer']} "
+                f"recon={entry['recon']:.2e} "
                 f"recon_pct={entry['recon_pct']:.2f}% "
-                f"uw_sparsity={entry['unweighted_l0']:.3f} "
-                f"layer={entry['layer']}"
+                f"active={entry['active_count']:.1f}"
             )
             group.train_log.append({
                 "time": datetime.datetime.now().isoformat(),
@@ -411,13 +421,12 @@ def main(
                 "layer": entry["layer"],
                 "recon": entry["recon"],
                 "recon_pct": entry["recon_pct"],
-                "unweighted_sparsity": entry["unweighted_l0"],
+                "active_count": entry["active_count"],
             })
             train_log_path = SAE_WEIGHTS_DIR / group.name / "train_log.json"
             with open(train_log_path, "w") as f:
                 json.dump(group.train_log, f, indent=2)
         print(" | ".join(parts))
-        print_vram("log")
 
     for step in range(start_step, max_steps):
         batch_start = step * BATCH_SIZE * CHUNK_SIZE
@@ -442,15 +451,28 @@ def main(
             sae = group.saes[layer_idx]
             opt = group.optimizers[layer_idx]
 
-            group.sparsity_coeffs[layer_idx], loss, l0, recon, unweighted_l0, recon_pct = train_SAE(
-                sae,
-                acts,
-                opt,
-                TARGET_ACTIVE,
-                group.sparsity_coeffs[layer_idx],
-                clip_grad_norm=CLIP_GRAD_NORM,
-                clip_grad_value=CLIP_GRAD_VALUE,
-            )
+            if SAE_TYPE == "topk":
+                loss, recon, recon_pct, active_count = train_TopKSAE(
+                    sae,
+                    acts,
+                    opt,
+                    k=TARGET_ACTIVE,
+                    clip_grad_norm=CLIP_GRAD_NORM,
+                    clip_grad_value=CLIP_GRAD_VALUE,
+                )
+                l0 = 0.0
+                unweighted_l0 = 0.0
+                group.sparsity_coeffs[layer_idx] = 0.0
+            else:
+                group.sparsity_coeffs[layer_idx], loss, l0, recon, unweighted_l0, recon_pct, active_count = train_GatedSAE(
+                    sae,
+                    acts,
+                    opt,
+                    TARGET_ACTIVE,
+                    group.sparsity_coeffs[layer_idx],
+                    clip_grad_norm=CLIP_GRAD_NORM,
+                    clip_grad_value=CLIP_GRAD_VALUE,
+                )
 
             del acts
 
@@ -463,6 +485,7 @@ def main(
                     "unweighted_l0": unweighted_l0,
                     "recon": recon,
                     "recon_pct": recon_pct,
+                    "active_count": active_count,
                     "sparsity_coeff": group.sparsity_coeffs[layer_idx],
                 })
 

@@ -1,44 +1,43 @@
 import torch
 import torch.nn as nn
 
-# Sparse autoencoder with:
+# Gated sparse autoencoder with:
 #   - JumpReLU-style slab gates (lower/upper bounds on feature pre-activations)
 #   - Cone gate via angle between input and encoder directions
 #   - Straight-through estimator so backprop flows through hard gates
 
-class SAE (nn.Module):
-    def __init__(self, embed_dim, expansion_factor, band_eps = 0.001):
+class GatedSAE(nn.Module):
+    def __init__(self, embed_dim, expansion_factor, band_eps=0.001):
         super().__init__()
         self.embed_dim = embed_dim
         self.feature_dim = embed_dim * expansion_factor
         self.band_eps = band_eps
 
         # dictionary weights
-        self.encoder_weight = nn.Parameter(torch.randn(self.feature_dim, self.embed_dim) / self.embed_dim ** 0.5) # (out, in) format
+        self.encoder_weight = nn.Parameter(torch.randn(self.feature_dim, self.embed_dim) / self.embed_dim ** 0.5)  # (out, in) format
         self.encoder_bias = nn.Parameter(torch.randn(self.feature_dim) / self.embed_dim ** 0.5)
         self.decoder_weight = nn.Parameter(torch.randn(self.embed_dim, self.feature_dim) / self.embed_dim ** 0.5)
         self.decoder_bias = nn.Parameter(torch.randn(self.embed_dim) / self.embed_dim ** 0.5)
 
         # gate weights
-        self.slab_gate_lower_bound = nn.Parameter(torch.zeros(self.feature_dim,))
+        self.slab_gate_lower_bound = nn.Parameter(torch.zeros(self.feature_dim))
         self.slab_gate_upper_bound = nn.Parameter(torch.full((self.feature_dim,), 10.0))
-        self.cone_gate_upper_bound = nn.Parameter(torch.full((self.feature_dim,), 1.57)) # initalize to right angle
-
+        self.cone_gate_upper_bound = nn.Parameter(torch.full((self.feature_dim,), 1.57))  # initialize to right angle
 
     # straight through estimator
     # we want to use hard for forward but use soft estimator for backprop
-    def ste_gate (self, arg, threshhold, lower_bound):
+    def ste_gate(self, arg, threshold, lower_bound):
         dtype = arg.dtype
-        if lower_bound == True:
-            hard = (arg >= threshhold).to(dtype)
-            smooth = torch.sigmoid ((arg - threshhold) / self.band_eps)
+        if lower_bound:
+            hard = (arg >= threshold).to(dtype)
+            smooth = torch.sigmoid((arg - threshold) / self.band_eps)
         else:
-            hard = (arg < threshhold).to(dtype)
-            smooth = torch.sigmoid ((threshhold - arg) / self.band_eps)
+            hard = (arg < threshold).to(dtype)
+            smooth = torch.sigmoid((threshold - arg) / self.band_eps)
         # forward value = hard, backward due to detach gradient uses soft
         return smooth + (hard - smooth).detach()
 
-    def encode (self, input):
+    def encode(self, input):
         input = input.to(self.encoder_weight.dtype)
 
         # feature pre-activations: project centered input onto encoder directions
@@ -46,13 +45,15 @@ class SAE (nn.Module):
 
         # slab gates: keep features inside [lower_bound, upper_bound]
         slab_lower_gate = self.ste_gate(pre_gate_features, self.slab_gate_lower_bound, True)
-        slab_upper_gate = self.ste_gate(pre_gate_features,self.slab_gate_upper_bound, False)
+        slab_upper_gate = self.ste_gate(pre_gate_features, self.slab_gate_upper_bound, False)
 
         # cone gate: only keep features whose encoder direction is close to the input direction
         angles = torch.acos(
-            ((input - self.decoder_bias) @ self.encoder_weight.T 
-            / (input - self.decoder_bias).norm(dim=-1, keepdim=True) / self.encoder_weight.norm(dim=-1))
-            .clamp(-1 + 1e-5, 1- 1e-5))
+            ((input - self.decoder_bias) @ self.encoder_weight.T
+             / (input - self.decoder_bias).norm(dim=-1, keepdim=True)
+             / self.encoder_weight.norm(dim=-1))
+            .clamp(-1 + 1e-5, 1 - 1e-5)
+        )
         cone_upper_gate = self.ste_gate(angles, self.cone_gate_upper_bound, False)
 
         # all three gates must be on for a feature to fire
@@ -60,16 +61,15 @@ class SAE (nn.Module):
         features = pre_gate_features * combined_gate
         return features, combined_gate
 
-    def decode (self, features):
+    def decode(self, features):
         return features @ self.decoder_weight.T
 
 
-
-# trains SAE from streaming activations of the model
-# assumes a sparsity_coeff is initalized at 1e-3
-# returns: (updated_sparsity_coeff, total_loss, l0_loss, recon_loss, unweighted_l0_loss, recon_pct)
-def train_SAE (
-    sae:SAE,
+# trains GatedSAE from streaming activations of the model
+# assumes a sparsity_coeff is initialized at 1e-3
+# returns: (updated_sparsity_coeff, total_loss, l0_loss, recon_loss, unweighted_l0_loss, recon_pct, active_count)
+def train_GatedSAE(
+    sae: GatedSAE,
     activation,
     optimizer,
     target_active,
@@ -80,9 +80,10 @@ def train_SAE (
     features, combined_gate = sae.encode(activation)
 
     # avg number of active features per token minus the target
-    error = (combined_gate.sum(-1) - target_active).mean()
+    active_count = combined_gate.sum(-1).mean()
+    error = active_count - target_active
     # adapt the sparsity coefficient: increase if too many features fire, decrease if too few
-    sparsity_coeff *= (1 + 0.01 * ( 1 if error.item() > 0 else -1 ))
+    sparsity_coeff *= (1 + 0.01 * (1 if error.item() > 0 else -1))
     # unweighted loss = how far over target we are (zero if under target)
     unweighted_l0_loss = torch.clamp(error, min=0)
     # weighted loss = what actually gets added to the total loss
@@ -106,5 +107,5 @@ def train_SAE (
 
     # keep decoder feature columns uniform
     with torch.no_grad():
-        sae.decoder_weight /= sae.decoder_weight.norm (dim = 0, keepdim = True)
-    return sparsity_coeff, loss.item(), l0_loss.item(), recon_loss.item(), unweighted_l0_loss.item(), recon_pct.item()
+        sae.decoder_weight /= sae.decoder_weight.norm(dim=0, keepdim=True)
+    return sparsity_coeff, loss.item(), l0_loss.item(), recon_loss.item(), unweighted_l0_loss.item(), recon_pct.item(), active_count.item()

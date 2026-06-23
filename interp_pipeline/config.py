@@ -42,6 +42,11 @@ TOKEN_DTYPE = "int32"
 #   "attention"       = trains attn_out + linear_attn_out in one run
 CAPTURE_TYPE = "attention"
 
+# which SAE architecture to train:
+#   "gated" = your custom GatedSAE (JumpReLU + cone gates)
+#   "topk"  = standard top-K SAE (sparsity enforced structurally, no sparsity loss)
+SAE_TYPE = "gated"
+
 EXPANSION_FACTOR = 16
 BATCH_SIZE = 16
 LEARNING_RATE = 5e-3
