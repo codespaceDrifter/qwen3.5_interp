@@ -72,6 +72,30 @@ def make_optimizer(sae: nn.Module, lr: float):
         return torch.optim.AdamW(sae.parameters(), lr=lr)
 
 
+def plot_train_log(train_log: list, save_path: Path):
+    """Plot recon_pct from train_log (matplotlib)."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        return
+    if len(train_log) < 2:
+        return
+
+    batches = [entry["batch"] for entry in train_log]
+    recon_pcts = [entry["recon_pct"] for entry in train_log]
+
+    plt.figure(figsize=(10, 6))
+    plt.plot(batches, recon_pcts, marker="o", markersize=3)
+    plt.xlabel("batch")
+    plt.ylabel("recon_pct (%)")
+    plt.title("SAE training")
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.close()
+
+
 def state_dict_to_cpu(state_dict):
     """Move every tensor in an optimizer state dict to CPU for cheap storage."""
     result = {}
@@ -426,6 +450,7 @@ def main(
             train_log_path = SAE_WEIGHTS_DIR / group.name / "train_log.json"
             with open(train_log_path, "w") as f:
                 json.dump(group.train_log, f, indent=2)
+            plot_train_log(group.train_log, train_log_path.with_name("loss.png"))
         print(" | ".join(parts))
 
     for step in range(start_step, max_steps):
