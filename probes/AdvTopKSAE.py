@@ -136,13 +136,14 @@ def train_AdvTopKSAE(
 
     auxk_loss = activation.new_tensor(0.0)
     if n_dead > 0:
-        dead_pre = pre * dead_mask.float()
+        dead_mask_t = dead_mask.to(pre.dtype)
+        dead_pre = pre * dead_mask_t
         if n_dead >= k:
             topk_dead = torch.topk(dead_pre, k=k, dim=-1)
             aux_features = torch.zeros_like(pre)
             aux_features.scatter_(-1, topk_dead.indices, F.relu(topk_dead.values))
         else:
-            aux_features = F.relu(pre) * dead_mask.float()
+            aux_features = F.relu(pre) * dead_mask_t
         aux_pred = sae.decode(aux_features)
         auxk_loss = (aux_pred - residual).pow(2).mean() * auxk_coeff
 
