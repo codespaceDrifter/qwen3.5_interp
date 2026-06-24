@@ -56,7 +56,7 @@ SPARSITY_COEFF_INIT = 1e-3
 
 # Advanced top-K SAE hyperparameters (used when SAE_TYPE = "adv_topk")
 AUXK_COEFF = 1.0 / 32.0
-RESAMPLE_EVERY = 1000      # chunks
+RESAMPLE_EVERY = 1         # chunks
 DEAD_THRESHOLD = 1e-5
 
 CHECKPOINT_EVERY = 100     # chunks

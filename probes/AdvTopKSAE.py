@@ -64,7 +64,7 @@ class AdvTopKSAE(nn.Module):
             self.resample_buffer.pop(0)
 
     @torch.no_grad()
-    def resample_dead_features(self, optimizer):
+    def resample_dead_features(self, optimizer, k):
         dead_mask = self.get_dead_mask()
         dead_indices = torch.where(dead_mask)[0]
         n_dead = dead_indices.numel()
@@ -74,9 +74,25 @@ class AdvTopKSAE(nn.Module):
         device = self.encoder_weight.device
         dtype = self.encoder_weight.dtype
 
+        # concatenate buffered activations and compute per-sample recon error
         all_acts = torch.cat(self.resample_buffer, dim=0).to(device).to(dtype)
-        idx = torch.randint(0, all_acts.shape[0], (n_dead,))
-        samples = all_acts[idx]
+        pre = (all_acts - self.decoder_bias) @ self.encoder_weight.T
+        pre_relu = F.relu(pre)
+        topk = torch.topk(pre_relu, k=k, dim=-1)
+        features = torch.zeros_like(pre_relu)
+        features.scatter_(-1, topk.indices, topk.values)
+        pred = features @ self.decoder_weight.T
+        errors = (pred - all_acts).pow(2).sum(dim=-1)
+
+        # use as many high-error activations as we have; sample with replacement if needed
+        n_samples = min(n_dead, all_acts.shape[0])
+        top_error_idx = torch.topk(errors, k=n_samples).indices
+        high_error_acts = all_acts[top_error_idx]
+        if n_dead > n_samples:
+            idx = torch.randint(0, n_samples, (n_dead,))
+            samples = high_error_acts[idx]
+        else:
+            samples = high_error_acts
         samples = samples / (samples.norm(dim=1, keepdim=True) + 1e-8)
 
         alive_mask = ~dead_mask
@@ -164,6 +180,6 @@ def train_AdvTopKSAE(
     sae.update_dead_features(features)
     sae.add_to_resample_buffer(activation)
     if step % resample_every == 0 and step > 0:
-        sae.resample_dead_features(optimizer)
+        sae.resample_dead_features(optimizer, k=k)
 
     return loss.item(), recon_loss.item(), recon_pct.item(), active_count.item()
