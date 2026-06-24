@@ -7,11 +7,11 @@ import torch.nn as nn
 #   - Straight-through estimator so backprop flows through hard gates
 
 class GatedSAE(nn.Module):
-    def __init__(self, embed_dim, expansion_factor, band_eps=0.001):
+    def __init__(self, embed_dim, expansion_factor):
         super().__init__()
         self.embed_dim = embed_dim
         self.feature_dim = embed_dim * expansion_factor
-        self.band_eps = band_eps
+        self.band_eps = 0.001
 
         # dictionary weights
         self.encoder_weight = nn.Parameter(torch.randn(self.feature_dim, self.embed_dim) / self.embed_dim ** 0.5)  # (out, in) format

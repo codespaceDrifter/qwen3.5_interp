@@ -16,7 +16,6 @@
 # usage from repo root:
 #   python3 -m interp_pipeline.sae_train
 
-import argparse
 import datetime
 import json
 import shutil
@@ -32,19 +31,21 @@ from qwen3_5_4b_implementation.config import Qwen3_5Config
 from qwen3_5_4b_implementation.loader import load_weights
 from qwen3_5_4b_implementation.model import Qwen3_5ForCausalLM
 from interp_pipeline.config import (
+    AUXK_COEFF,
     BATCH_SIZE,
-    BAND_EPS,
     CAPTURE_TYPE,
     CHECKPOINT_EVERY,
     CHUNK_SIZE,
     CLIP_GRAD_NORM,
     CLIP_GRAD_VALUE,
+    DEAD_THRESHOLD,
     DEVICE,
     EXPANSION_FACTOR,
     LEARNING_RATE,
     LOG_EVERY,
     MAX_TRAIN_CHUNKS,
     PAGE_OPTIMIZERS,
+    RESAMPLE_EVERY,
     SAE_DTYPE,
     SAE_TYPE,
     SAE_WEIGHTS_DIR,
@@ -53,6 +54,7 @@ from interp_pipeline.config import (
     TOKENIZED_DIR,
     TOKEN_DTYPE,
 )
+from probes.AdvTopKSAE import AdvTopKSAE, train_AdvTopKSAE
 from probes.GatedSAE import GatedSAE, train_GatedSAE
 from probes.TopKSAE import TopKSAE, train_TopKSAE
 
@@ -61,15 +63,15 @@ from probes.TopKSAE import TopKSAE, train_TopKSAE
 # helpers
 # =========================================================================================
 
-def make_optimizer(sae: nn.Module, lr: float):
+def make_optimizer(sae: nn.Module, lr: float, betas=(0.9, 0.999)):
     """Build PagedAdamW8bit if available and configured, otherwise 8-bit/full AdamW."""
     try:
         import bitsandbytes as bnb
         if PAGE_OPTIMIZERS:
-            return bnb.optim.PagedAdamW8bit(sae.parameters(), lr=lr)
-        return bnb.optim.AdamW8bit(sae.parameters(), lr=lr)
+            return bnb.optim.PagedAdamW8bit(sae.parameters(), lr=lr, betas=betas)
+        return bnb.optim.AdamW8bit(sae.parameters(), lr=lr, betas=betas)
     except ImportError:
-        return torch.optim.AdamW(sae.parameters(), lr=lr)
+        return torch.optim.AdamW(sae.parameters(), lr=lr, betas=betas)
 
 
 def plot_train_log(train_log: list, save_path: Path):
@@ -94,6 +96,46 @@ def plot_train_log(train_log: list, save_path: Path):
     save_path.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(save_path, dpi=150, bbox_inches="tight")
     plt.close()
+
+
+def plot_layer_grid_html(group, save_path: Path):
+    """Interactive HTML grid: one recon_pct curve per layer."""
+    try:
+        import plotly.graph_objects as go
+        from plotly.subplots import make_subplots
+    except ImportError:
+        return
+    if len(group.log) < 2:
+        return
+
+    layers = sorted({e["layer"] for e in group.log})
+    rows, cols = 8, 4
+    fig = make_subplots(
+        rows=rows,
+        cols=cols,
+        subplot_titles=[f"layer {l}" for l in layers],
+        shared_xaxes=True,
+        shared_yaxes=True,
+        vertical_spacing=0.04,
+        horizontal_spacing=0.04,
+    )
+    for idx, layer in enumerate(layers):
+        entries = [e for e in group.log if e["layer"] == layer]
+        xs = [e["step"] for e in entries]
+        ys = [e["recon_pct"] for e in entries]
+        r = idx // cols + 1
+        c = idx % cols + 1
+        fig.add_trace(
+            go.Scatter(x=xs, y=ys, mode="lines", showlegend=False, line=dict(width=1)),
+            row=r, col=c,
+        )
+    fig.update_layout(
+        title=f"{group.name} per-layer recon_pct (%)",
+        height=1600,
+        width=1400,
+    )
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.write_html(save_path, include_plotlyjs="cdn")
 
 
 def state_dict_to_cpu(state_dict):
@@ -308,13 +350,19 @@ class CaptureGroup:
 
 
 def build_capture_group(name: str, num_layers: int, hidden_size: int, device, dtype):
-    # pick SAE architecture from config
-    if SAE_TYPE == "topk":
+    # pick SAE architecture and optimizer settings from config
+    if SAE_TYPE == "adv_topk":
+        sae_cls = AdvTopKSAE
+        sae_kwargs = {"auxk_coeff": AUXK_COEFF, "dead_threshold": DEAD_THRESHOLD}
+        betas = (0.0, 0.999)
+    elif SAE_TYPE == "topk":
         sae_cls = TopKSAE
         sae_kwargs = {}
+        betas = (0.9, 0.999)
     else:
         sae_cls = GatedSAE
-        sae_kwargs = {"band_eps": BAND_EPS}
+        sae_kwargs = {}
+        betas = (0.9, 0.999)
 
     # one SAE per layer; all 32 live on GPU
     saes = nn.ModuleList([
@@ -322,7 +370,7 @@ def build_capture_group(name: str, num_layers: int, hidden_size: int, device, dt
         for _ in range(num_layers)
     ]).to(device).to(dtype)
     # one optimizer per SAE; PagedAdamW8bit keeps most state in CPU RAM
-    optimizers = [make_optimizer(sae, LEARNING_RATE) for sae in saes]
+    optimizers = [make_optimizer(sae, LEARNING_RATE, betas=betas) for sae in saes]
     sparsity_coeffs = [SPARSITY_COEFF_INIT for _ in saes]
     return CaptureGroup(
         name=name,
@@ -452,6 +500,7 @@ def main(
             with open(train_log_path, "w") as f:
                 json.dump(group.train_log, f, indent=2)
             plot_train_log(group.train_log, train_log_path.with_name("loss.png"))
+            plot_layer_grid_html(group, train_log_path.with_name("layers.html"))
         print(" | ".join(parts))
 
     for step in range(start_step, max_steps):
@@ -483,6 +532,21 @@ def main(
                     acts,
                     opt,
                     k=TARGET_ACTIVE,
+                    clip_grad_norm=CLIP_GRAD_NORM,
+                    clip_grad_value=CLIP_GRAD_VALUE,
+                )
+                l0 = 0.0
+                unweighted_l0 = 0.0
+                group.sparsity_coeffs[layer_idx] = 0.0
+            elif SAE_TYPE == "adv_topk":
+                loss, recon, recon_pct, active_count = train_AdvTopKSAE(
+                    sae,
+                    acts,
+                    opt,
+                    k=TARGET_ACTIVE,
+                    step=step,
+                    resample_every=RESAMPLE_EVERY,
+                    auxk_coeff=AUXK_COEFF,
                     clip_grad_norm=CLIP_GRAD_NORM,
                     clip_grad_value=CLIP_GRAD_VALUE,
                 )
@@ -548,24 +612,5 @@ def main(
     print_vram("final")
 
 
-def _dtype_from_string(s: str) -> torch.dtype:
-    return {
-        "bfloat16": torch.bfloat16,
-        "float16": torch.float16,
-        "float32": torch.float32,
-    }.get(s, torch.bfloat16)
-
-
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Train layer-wise SAEs on Qwen3.5-4B activations. "
-        "Edit interp_pipeline/config.py to change hyperparameters."
-    )
-    parser.add_argument("--device", default=DEVICE)
-    parser.add_argument("--dtype", default="bfloat16", help="bfloat16|float16|float32")
-    args = parser.parse_args()
-
-    main(
-        device=args.device,
-        dtype=_dtype_from_string(args.dtype),
-    )
+    main(device=DEVICE, dtype=SAE_DTYPE)
