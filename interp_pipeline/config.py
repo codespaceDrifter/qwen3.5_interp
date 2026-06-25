@@ -57,7 +57,11 @@ SPARSITY_COEFF_INIT = 1e-3
 # Advanced top-K SAE hyperparameters (used when SAE_TYPE = "adv_topk")
 AUXK_COEFF = 1.0 / 32.0
 RESAMPLE_EVERY = 1         # chunks
+RESAMPLE_COOLDOWN = 10     # steps a feature is protected after being resampled
 DEAD_THRESHOLD = 1e-5
+
+# global LR warmup for all SAE types
+LR_WARMUP_STEPS = 1000
 
 CHECKPOINT_EVERY = 100     # chunks
 LOG_EVERY = 10            # chunks

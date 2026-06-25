@@ -43,8 +43,10 @@ from interp_pipeline.config import (
     EXPANSION_FACTOR,
     LEARNING_RATE,
     LOG_EVERY,
+    LR_WARMUP_STEPS,
     MAX_TRAIN_CHUNKS,
     PAGE_OPTIMIZERS,
+    RESAMPLE_COOLDOWN,
     RESAMPLE_EVERY,
     SAE_DTYPE,
     SAE_TYPE,
@@ -353,7 +355,11 @@ def build_capture_group(name: str, num_layers: int, hidden_size: int, device, dt
     # pick SAE architecture and optimizer settings from config
     if SAE_TYPE == "adv_topk":
         sae_cls = AdvTopKSAE
-        sae_kwargs = {"auxk_coeff": AUXK_COEFF, "dead_threshold": DEAD_THRESHOLD}
+        sae_kwargs = {
+            "auxk_coeff": AUXK_COEFF,
+            "dead_threshold": DEAD_THRESHOLD,
+            "cooldown_steps": RESAMPLE_COOLDOWN,
+        }
         betas = (0.0, 0.999)
     elif SAE_TYPE == "topk":
         sae_cls = TopKSAE
@@ -504,6 +510,16 @@ def main(
         print(" | ".join(parts))
 
     for step in range(start_step, max_steps):
+        # global LR warmup
+        if LR_WARMUP_STEPS > 0:
+            lr_scale = min(1.0, step / LR_WARMUP_STEPS)
+        else:
+            lr_scale = 1.0
+        for group in groups:
+            for opt in group.optimizers:
+                for pg in opt.param_groups:
+                    pg["lr"] = LEARNING_RATE * lr_scale
+
         batch_start = step * BATCH_SIZE * CHUNK_SIZE
         batch_end = batch_start + BATCH_SIZE * CHUNK_SIZE
         if batch_end > len(all_tokens):

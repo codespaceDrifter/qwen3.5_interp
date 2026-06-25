@@ -3,25 +3,29 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 # Advanced top-K SAE:
-#   - no encoder bias (threshold fixed at zero)
+#   - top-K activation
 #   - auxiliary K loss on dead features (AuxK)
-#   - feature resampling
+#   - feature resampling with per-feature cooldown
 #   - intended to be used with Adam beta1 = 0
 
 class AdvTopKSAE(nn.Module):
-    def __init__(self, embed_dim, expansion_factor, auxk_coeff=1.0/32.0, dead_threshold=1e-5):
+    def __init__(self, embed_dim, expansion_factor, auxk_coeff=1.0/32.0, dead_threshold=1e-5, cooldown_steps=10):
         super().__init__()
         self.embed_dim = embed_dim
         self.feature_dim = embed_dim * expansion_factor
         self.auxk_coeff = auxk_coeff
         self.dead_threshold = dead_threshold
+        self.cooldown_steps = cooldown_steps
 
         self.encoder_weight = nn.Parameter(torch.randn(self.feature_dim, self.embed_dim) / self.embed_dim ** 0.5)
+        self.encoder_bias = nn.Parameter(torch.zeros(self.feature_dim))
         self.decoder_weight = nn.Parameter(torch.randn(self.embed_dim, self.feature_dim) / self.embed_dim ** 0.5)
         self.decoder_bias = nn.Parameter(torch.randn(self.embed_dim) / self.embed_dim ** 0.5)
 
         # activation frequency EMA per feature
         self.register_buffer("activation_ema", torch.zeros(self.feature_dim))
+        # cooldown counter: how many steps until a feature is eligible for resampling again
+        self.register_buffer("resample_cooldown", torch.zeros(self.feature_dim, dtype=torch.long))
         # small ring buffer of recent activations for resampling
         self.resample_buffer = []
         self.resample_buffer_max_entries = 128
@@ -29,8 +33,7 @@ class AdvTopKSAE(nn.Module):
 
     def encode(self, input, k):
         input = input.to(self.encoder_weight.dtype)
-        # no encoder bias: threshold fixed at zero
-        pre = (input - self.decoder_bias) @ self.encoder_weight.T
+        pre = (input - self.decoder_bias) @ self.encoder_weight.T + self.encoder_bias
         pre_relu = F.relu(pre)
         topk = torch.topk(pre_relu, k=k, dim=-1)
         features = torch.zeros_like(pre_relu)
@@ -66,7 +69,8 @@ class AdvTopKSAE(nn.Module):
     @torch.no_grad()
     def resample_dead_features(self, optimizer, k):
         dead_mask = self.get_dead_mask()
-        dead_indices = torch.where(dead_mask)[0]
+        eligible = dead_mask & (self.resample_cooldown <= 0)
+        dead_indices = torch.where(eligible)[0]
         n_dead = dead_indices.numel()
         if n_dead == 0 or len(self.resample_buffer) == 0:
             return
@@ -76,7 +80,7 @@ class AdvTopKSAE(nn.Module):
 
         # concatenate buffered activations and compute per-sample recon error
         all_acts = torch.cat(self.resample_buffer, dim=0).to(device).to(dtype)
-        pre = (all_acts - self.decoder_bias) @ self.encoder_weight.T
+        pre = (all_acts - self.decoder_bias) @ self.encoder_weight.T + self.encoder_bias
         pre_relu = F.relu(pre)
         topk = torch.topk(pre_relu, k=k, dim=-1)
         features = torch.zeros_like(pre_relu)
@@ -95,15 +99,11 @@ class AdvTopKSAE(nn.Module):
             samples = high_error_acts
         samples = samples / (samples.norm(dim=1, keepdim=True) + 1e-8)
 
-        alive_mask = ~dead_mask
-        if alive_mask.any():
-            avg_alive_norm = self.encoder_weight[alive_mask].norm(dim=1).mean()
-        else:
-            avg_alive_norm = 1.0
-
-        self.encoder_weight[dead_indices] = samples * avg_alive_norm
+        # reset both encoder and decoder directions to unit-norm high-error directions
+        self.encoder_weight[dead_indices] = samples
         self.decoder_weight[:, dead_indices] = samples.T
         self.activation_ema[dead_indices] = 1.0
+        self.resample_cooldown[dead_indices] = self.cooldown_steps
 
         # reset optimizer state for dead features (best-effort)
         for group in optimizer.param_groups:
@@ -129,7 +129,7 @@ def train_AdvTopKSAE(
     optimizer,
     k,
     step,
-    resample_every=1000,
+    resample_every=1,
     auxk_coeff=None,
     clip_grad_norm=None,
     clip_grad_value=None,
@@ -179,6 +179,10 @@ def train_AdvTopKSAE(
 
     sae.update_dead_features(features)
     sae.add_to_resample_buffer(activation)
+
+    # decrement cooldowns
+    sae.resample_cooldown = (sae.resample_cooldown - 1).clamp(min=0)
+
     if step % resample_every == 0 and step > 0:
         sae.resample_dead_features(optimizer, k=k)
 
